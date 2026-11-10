@@ -1,0 +1,10 @@
+project_id = "i-workfolio"
+
+[functions.ai-writing-assistant]
+verify_jwt = false
+
+[functions.share-portfolio]
+verify_jwt = true
+
+[functions.delete-account]
+verify_jwt = true

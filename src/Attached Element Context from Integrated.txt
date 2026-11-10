@@ -1,0 +1,53 @@
+Attached Element Context from Integrated Browser
+
+Element: h2
+
+URL: http://localhost:5173/
+
+HTML Path: div#root > div.dashboard > main.dashboard-main > div.student-home > section.home-section > div.section-title-row > h2
+
+Outer HTML:
+```html
+<h2>Module Introduction Progress</h2>
+```
+
+Dimensions:
+- top: 144px
+- left: 36px
+- width: 231px
+- height: 24px
+
+CSS:
+```css
+* { box-sizing: border-box; }
+.section-title-row h2 { margin: 0;
+  font-size: 17px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: #171717; }
+html:not(.dark-mode) .dashboard-main h1, html:not(.dark-mode) .dashboard-main h2, html:not(.dark-mode) .dashboard-main h3, html:not(.dark-mode) .dashboard-main h4, html:not(.dark-mode) .dashboard-main strong, html:not(.dark-mode) .dashboard-main label { color: #171717; }
+
+/* Inherited */
+html:not(.dark-mode) .dashboard-main .dashboard-section, html:not(.dark-mode) .dashboard-main .home-section, html:not(.dark-mode) .dashboard-main .settings-section, html:not(.dark-mode) .dashboard-main .settings-danger, html:not(.dark-mode) .dashboard-main .academic-card, html:not(.dark-mode) .dashboard-main .portfolio-folder, html:not(.dark-mode) .dashboard-main .overall-progress-card, html:not(.dark-mode) .dashboard-main .progress-module-card, html:not(.dark-mode) .dashboard-main .feedback-empty-card, html:not(.dark-mode) .dashboard-main .class-info-card, html:not(.dark-mode) .dashboard-main .submission-empty-card, html:not(.dark-mode) .dashboard-main .leaderboard-empty-card, html:not(.dark-mode) .dashboard-main .notification-empty-card, html:not(.dark-mode) .dashboard-main .help-center-card, html:not(.dark-mode) .dashboard-main .help-guide-card, html:not(.dark-mode) .dashboard-main .faq-card, html:not(.dark-mode) .dashboard-main .profile-completion-card, html:not(.dark-mode) .dashboard-main .profile-photo-card, html:not(.dark-mode) .dashboard-main .profile-info-section { color: #171717 !important }
+html:not(.dark-mode) body, html:not(.dark-mode) #root, html:not(.dark-mode) .dashboard, html:not(.dark-mode) .dashboard-main { color: #171717 }
+body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+  "SF Pro Text", "Segoe UI", sans-serif; font-size: 14px }
+:root { font-family: Arial, Helvetica, sans-serif; color: #171717 }
+
+/* Resolved values */
+margin: 0px;
+box-sizing: border-box;
+color: rgb(23, 23, 23);
+display: block;
+font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", sans-serif;
+font-size: 17px;
+font-weight: 500;
+height: 23.8px;
+line-height: 23.8px;
+margin-block-end: 0px /*UA*/;
+margin-block-start: 0px /*UA*/;
+margin-inline-end: 0px /*UA*/;
+margin-inline-start: 0px /*UA*/;
+unicode-bidi: isolate /*UA*/;
+width: 231.288px;
+```
