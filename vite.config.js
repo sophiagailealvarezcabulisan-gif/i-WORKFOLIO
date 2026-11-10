@@ -38,10 +38,12 @@ export default defineConfig({
         ]
       },
 
-      workbox: {
-        globPatterns: [
-          '**/*.{js,css,html,ico,png,jpg,jpeg,webp,svg,woff2,json,pdf,docx}'
-        ],
+    workbox: {
+  maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
+
+  globPatterns: [
+    '**/*.{js,css,html,ico,png,jpg,jpeg,webp,svg,woff2,json,pdf,docx}'
+  ],
         navigateFallback: '/index.html',
         navigateFallbackDenylist: [/^\/(rest|auth|storage|functions)\/v1(?:\/|$)/],
         cleanupOutdatedCaches: true
