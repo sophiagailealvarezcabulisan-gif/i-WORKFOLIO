@@ -1,4 +1,3 @@
-import html2pdf from 'html2pdf.js';
 import { downloadPortfolioPDF } from './downloadPortfolioPDF'
 import { useState, useEffect, useRef } from 'react'
 import { supabase } from './supabaseClient'
@@ -31,9 +30,7 @@ import {
   BookOpen,
   TrendingUp,
   MessageSquare,
-  Trophy,
   Bell,
-  Clock3,
   User,
   Settings,
   HelpCircle,
@@ -81,24 +78,61 @@ function isAcademicStrand(strand) {
   return String(strand || '').trim().toUpperCase() === 'ACADEMIC'
 }
 
-async function loadStudentProfile(userId) {
+async function loadStudentProfile(authUser) {
+  const userId = authUser?.id
+  if (!userId) throw new Error('The authenticated account ID is unavailable.')
+
   const cacheKey = `profile:${userId}`
-  const cached = await getOfflineData(cacheKey)
+  const cachedProfile = await getOfflineData(cacheKey)
+  const cached = cachedProfile?.id === userId ? cachedProfile : null
   if (!navigator.onLine) return cached
 
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('*')
-    .eq('id', userId)
-    .maybeSingle()
-
-  if (error) {
-    if (cached) return cached
-    throw error
+  const { data, error } = await supabase.rpc('ensure_student_profile')
+  if (error) throw error
+  if (!data || data.id !== userId) {
+    throw new Error('The profile service did not return a profile for this authenticated account.')
   }
+  await saveOfflineData(cacheKey, data)
+  return data
+}
 
-  if (data) await saveOfflineData(cacheKey, data)
-  return data || cached
+function readStoredAuthUser() {
+  try {
+    const storedKeys = Object.keys(window.localStorage)
+      .filter((key) => /^sb-.*-auth-token(?:\.\d+)?$/.test(key))
+      .sort((left, right) => {
+        const leftIndex = Number(left.split('.').pop()) || 0
+        const rightIndex = Number(right.split('.').pop()) || 0
+        return leftIndex - rightIndex
+      })
+    if (!storedKeys.length) return null
+
+    let text = storedKeys
+      .map((key) => window.localStorage.getItem(key) || '')
+      .join('')
+    if (text.startsWith('base64-')) {
+      const binary = atob(text.slice('base64-'.length))
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
+      text = new TextDecoder().decode(bytes)
+    }
+    const parsed = JSON.parse(text)
+    const session = parsed?.currentSession || parsed?.session || parsed
+    return session?.user || null
+  } catch {
+    return null
+  }
+}
+
+function getDashboardProfileIssue(profile) {
+  if (!profile) return 'Your account profile could not be found.'
+  if (profile.role === 'teacher') return ''
+  if (profile.role !== 'student') {
+    return 'Your account role could not be verified from its profile.'
+  }
+  if (!['TVL', 'ACADEMIC'].includes(String(profile.strand || '').trim().toUpperCase())) {
+    return 'Your student profile does not have a recognized strand. Your dashboard was not opened to avoid showing the wrong portfolio.'
+  }
+  return ''
 }
 
 async function resolvePortfolioPhotoUrl(userId, path) {
@@ -162,6 +196,8 @@ function App() {
   const [page, setPage] = useState('home')
   const [mode, setMode] = useState('student')
   const [authLoading, setAuthLoading] = useState(true)
+  const [profileRecovery, setProfileRecovery] = useState(null)
+  const [profileRecoveryLoading, setProfileRecoveryLoading] = useState(false)
   const passwordRecoveryActive = useRef(false)
   const [isOffline, setIsOffline] = useState(!navigator.onLine)
   const [syncState, setSyncState] = useState('idle')
@@ -175,6 +211,61 @@ function App() {
 
   const isEmailVerified = (authUser) =>
     Boolean(authUser?.email_confirmed_at || authUser?.confirmed_at)
+
+  const openProfileRecovery = (authUser, message) => {
+    setUser(authUser)
+    setProfileRecovery({ authUser, message })
+    setPage('profile-recovery')
+  }
+
+  const finishProfileLoad = (authUser, profile) => {
+    const profileIssue = getDashboardProfileIssue(profile)
+    if (profileIssue) {
+      openProfileRecovery(authUser, profileIssue)
+      return false
+    }
+
+    const completeUser = { ...authUser, ...profile }
+    setUser(completeUser)
+    setProfileRecovery(null)
+    document.documentElement.classList.toggle(
+      'dark-mode',
+      profile.dark_mode === true
+    )
+    setPage(profile.role === 'teacher' ? 'teacher' : 'student')
+    return true
+  }
+
+  const retryProfileRecovery = async () => {
+    if (!profileRecovery?.authUser?.id) return
+
+    setProfileRecoveryLoading(true)
+    try {
+      const profile = await loadStudentProfile(profileRecovery.authUser)
+      const profileIssue = getDashboardProfileIssue(profile)
+      if (profileIssue) {
+        setProfileRecovery((current) => (
+          current
+            ? { ...current, message: profileIssue }
+            : current
+        ))
+        return
+      }
+      finishProfileLoad(profileRecovery.authUser, profile)
+    } catch (error) {
+      console.error('Retry profile load failed:', error)
+      setProfileRecovery((current) => (
+        current
+          ? {
+            ...current,
+            message: error?.message || 'Could not load your account profile. Check your connection and try again.',
+          }
+          : current
+      ))
+    } finally {
+      setProfileRecoveryLoading(false)
+    }
+  }
 
   const refreshPendingCount = async (userId = user?.id) => {
     const count = userId ? (await getPendingSync(userId)).length : 0
@@ -362,49 +453,62 @@ function App() {
 
   useEffect(() => {
     const loadSession = async () => {
+      let restoredUser = null
       try {
         const {
           data: { session },
         } = await supabase.auth.getSession()
 
-        if (session?.user) {
+        // Offline an expired token cannot be refreshed, so Supabase reports no
+        // session. Fall back to the session it saved on this device.
+        const offlineUser =
+          !navigator.onLine && !session?.user
+            ? readStoredAuthUser()
+            : null
+        const sessionUser = session?.user || offlineUser
+
+        if (sessionUser) {
+        restoredUser = sessionUser
         const recoveryRequested = new URLSearchParams(window.location.hash.slice(1)).get('type') === 'recovery'
         if (recoveryRequested) {
           passwordRecoveryActive.current = true
-          setUser(session.user)
+          setUser(sessionUser)
           setPage('password-recovery')
           setAuthLoading(false)
           return
         }
 
-        if (!isEmailVerified(session.user)) {
-          setUser(session.user)
-          setVerificationEmail(session.user.email || '')
+        if (!isEmailVerified(sessionUser)) {
+          setUser(sessionUser)
+          setVerificationEmail(sessionUser.email || '')
           setPage('email-verification')
           setAuthLoading(false)
           return
         }
 
-        const profile = await loadStudentProfile(session.user.id)
-
-        setUser({
-          ...session.user,
-          ...profile,
-        })
-
-        document.documentElement.classList.toggle(
-          'dark-mode',
-          profile?.dark_mode === true
-        )
-
-        if (profile?.role === 'teacher') {
-          setPage('teacher')
-        } else {
-          setPage('student')
-        }
+        const profile = await loadStudentProfile(sessionUser)
+        finishProfileLoad(sessionUser, profile)
         }
       } catch (error) {
         console.error('Load saved session failed:', error)
+        const offlineUser = !navigator.onLine ? readStoredAuthUser() : null
+        if (offlineUser && isEmailVerified(offlineUser)) {
+          try {
+            const profile = await loadStudentProfile(offlineUser)
+            finishProfileLoad(offlineUser, profile)
+          } catch (profileError) {
+            console.error('Offline profile load failed:', profileError)
+            openProfileRecovery(
+              offlineUser,
+              'You are offline and this account has no saved dashboard data on this device yet. Reconnect once to load it.'
+            )
+          }
+        } else if (restoredUser && isEmailVerified(restoredUser)) {
+          openProfileRecovery(
+            restoredUser,
+            error?.message || 'Could not load your account profile. Check your connection and try again.'
+          )
+        }
       } finally {
         setAuthLoading(false)
       }
@@ -422,6 +526,7 @@ function App() {
             return
           }
           setUser(null)
+          setProfileRecovery(null)
           setPage('home')
           setAuthLoading(false)
           return
@@ -448,30 +553,18 @@ function App() {
 
         let profile
         try {
-          profile = await loadStudentProfile(session.user.id)
+          profile = await loadStudentProfile(session.user)
         } catch (error) {
           console.error('Load profile after authentication failed:', error)
+          openProfileRecovery(
+            session.user,
+            error?.message || 'Could not load your account profile. Check your connection and try again.'
+          )
           setAuthLoading(false)
           return
         }
 
-        const completeUser = {
-          ...session.user,
-          ...profile,
-        }
-
-        setUser(completeUser)
-
-        document.documentElement.classList.toggle(
-          'dark-mode',
-          profile?.dark_mode === true
-        )
-
-        if (completeUser?.role === 'teacher') {
-          setPage('teacher')
-        } else {
-          setPage('student')
-        }
+        finishProfileLoad(session.user, profile)
 
         setAuthLoading(false)
       }
@@ -494,28 +587,17 @@ function App() {
 
   let profile
   try {
-    profile = await loadStudentProfile(loggedInUser.id)
-    if (!profile) throw new Error('No saved profile is available for this account.')
+    profile = await loadStudentProfile(loggedInUser)
   } catch (error) {
     console.error('LOGIN PROFILE ERROR:', error)
-    alert('Cannot load profile: ' + error.message)
+    openProfileRecovery(
+      loggedInUser,
+      error?.message || 'Could not load your account profile. Check your connection and try again.'
+    )
     return
   }
 
-  const completeUser = {
-    ...loggedInUser,
-    ...profile,
-  }
-
-  console.log('PROFILE ROLE:', profile.role)
-
-  setUser(completeUser)
-
-  if (profile.role === 'teacher') {
-    setPage('teacher')
-  } else {
-    setPage('student')
-  }
+  finishProfileLoad(loggedInUser, profile)
 }
 
   const handleLogout = async () => {
@@ -523,6 +605,7 @@ function App() {
 
     document.documentElement.classList.remove('dark-mode')
     setUser(null)
+    setProfileRecovery(null)
     setPage('home')
   }
 
@@ -533,26 +616,58 @@ function App() {
       document.title,
       `${window.location.pathname}${window.location.search}`
     )
-    const { data: profile, error } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', user?.id)
-      .single()
-    if (error) {
+    let profile
+    try {
+      profile = await loadStudentProfile(user)
+    } catch (error) {
       console.error('Load profile after password recovery failed:', error)
-      setUser(null)
-      setPage('login')
+      openProfileRecovery(
+        user,
+        error?.message || 'Could not load your account profile. Check your connection and try again.'
+      )
       return
     }
-    const completeUser = { ...user, ...profile }
-    setUser(completeUser)
-    setPage(completeUser?.role === 'teacher' ? 'teacher' : 'student')
+    finishProfileLoad(user, profile)
   }
 
   if (authLoading) {
     return (
       <div className="auth-loading">
         Loading i-WORKFOLIO...
+      </div>
+    )
+  }
+
+  if (page === 'profile-recovery' && profileRecovery) {
+    return (
+      <div className="login-page">
+        <div className="login-card">
+          <div className="brand login-brand">
+            <div className="brand-icon">i</div>
+            <span>i-WORKFOLIO</span>
+          </div>
+          <h1>Profile unavailable</h1>
+          <p className="login-error" role="alert">{profileRecovery.message}</p>
+          <p>
+            Your account profile must be loaded and its student strand verified before the student dashboard can be opened.
+          </p>
+          <button
+            type="button"
+            className="primary-btn full-btn"
+            onClick={retryProfileRecovery}
+            disabled={profileRecoveryLoading}
+          >
+            {profileRecoveryLoading ? 'Retrying profile load...' : 'Retry profile load'}
+          </button>
+          <button
+            type="button"
+            className="link-btn"
+            onClick={handleLogout}
+            disabled={profileRecoveryLoading}
+          >
+            Log out
+          </button>
+        </div>
       </div>
     )
   }
@@ -1247,6 +1362,7 @@ console.log('USER ROLE:', user?.role)
     ['My Profile', User],
     ['Settings', Settings],
   ]
+  const isAcademicStudent = isStudent && isAcademicStrand(user?.strand)
 
   const teacherMenu = [
     ['Home', Home],
@@ -1551,7 +1667,13 @@ function StudentContent({
     activePage ===
     'My Portfolio'
   ) {
-    if (isAcademicStudent) return null
+    if (isAcademicStudent) {
+      return (
+        <AcademicPortfolio
+          user={user}
+        />
+      )
+    }
 
     return (
       <PortfolioDocumentFrame>
@@ -1564,7 +1686,7 @@ function StudentContent({
     activePage === 'Progress'
   ) {
     if (isAcademicStudent) {
-      return <AcademicProgress />
+      return <AcademicProgress user={user} />
     }
 
     return (
@@ -1593,28 +1715,6 @@ function StudentContent({
   ) {
     return (
       <WorkImmersionClass
-        user={user}
-      />
-    )
-  }
-
-  if (
-    activePage ===
-    'Submission History'
-  ) {
-    return (
-      <SubmissionHistory
-        user={user}
-      />
-    )
-  }
-
-  if (
-    activePage ===
-    'Leaderboard'
-  ) {
-    return (
-      <Leaderboard
         user={user}
       />
     )
@@ -2009,28 +2109,3609 @@ function StudentProgress({ user }) {
   )
 }
 
-function AcademicProgress() {
+const ACADEMIC_STUDENT_INFORMATION_SECTION = 'Academic Portfolio/Student Information Sheet'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_ONE_SECTION = 'Academic Portfolio/Pre-Immersion/Activity 1 - The Worker'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_TWO_SECTION = 'Academic Portfolio/Pre-Immersion/Activity 2'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_THREE_SECTION = 'Academic Portfolio/Pre-Immersion/Activity 3 - Situational Analysis'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_FOUR_SECTION = 'Academic Portfolio/Pre-Immersion/Activity 4 - Conflict Resolution'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_FIVE_SECTION = 'Academic Portfolio/Pre-Immersion/Activity 5 - Resume Writing'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_SIX_SECTION = 'Academic Portfolio/Pre-Immersion/Activity 6 - Letter Writing'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_SEVEN_SECTION = 'Academic Portfolio/Pre-Immersion/Activity 7 - Clearances'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_EIGHT_SECTION = 'Academic Portfolio/Pre-Immersion/Activity 8 - Medical Certificate'
+const ACADEMIC_PRE_IMMERSION_ACTIVITY_TWO_ROWS = Array.from({ length: 15 }, (_, index) => ({
+  number: index + 1,
+  dosKey: `dos_${index + 1}`,
+  dontsKey: `donts_${index + 1}`,
+}))
+const ACADEMIC_PRE_IMMERSION_CLEARANCE_STEPS = Array.from({ length: 5 }, (_, index) => ({
+  number: index + 1,
+  key: `step_${index + 1}`,
+}))
+const ACADEMIC_ACTIVITY_NINE_QUESTION_GROUPS = [
+  {
+    key: 'interpersonal_skills',
+    title: 'A. Interpersonal Skills',
+    questions: [
+      'What are your strengths? What are your weaknesses?',
+      'What do you do when you know you are right and your boss disagrees with you? Give me an example.',
+      'If your colleagues had an opportunity to tell us your primary strength what would that be? And, your primary weakness-what would that be?',
+      'As a component of this position, you may have to work on a team on certain projects. Describe when you’ve worked on a team before and what, in your opinion, constitutes an effective team? What do you expect from others on the team and what do you need from others on the team?',
+      'What do you do when others resist of reject your ideas or actions?',
+    ],
+  },
+  {
+    key: 'behavioural',
+    title: 'B. Behavioural',
+    questions: [
+      'Suppose you are in a situation where deadlines and priorities change frequently and rapidly. How would you handle it?',
+      'How do you know when you are stressed? What do you do to de-stress?',
+      'Tell me about a time when you were a part of a great team. What was your part in making the team effective?',
+      'Suppose your supervisor asked you to get information for them that you know is confidential and he/she should not have access to. What would you do?',
+      'Describe a time when you performed a task outside your perceived responsibilities. What was the task? Why did you perceive it to be outside your responsibilities? What was the outcome?',
+    ],
+  },
+  {
+    key: 'creative_thinking',
+    title: 'C. Creative Thinking',
+    questions: [
+      'What’s the best book you’ve read in the last year? Please take a minute and tell us what you liked about it.',
+      'What was the most creative thing you did in your last job?',
+      'What is your interpretation of “success?”',
+      'Describe an ideal work environment or “the perfect job.”',
+      'In what way(s) do you express your personality in the workplace?',
+    ],
+  },
+  {
+    key: 'leadership',
+    title: 'D. Leadership',
+    questions: [
+      'How would you describe an ideal supervisor?',
+      'What strengths did you rely on in your last position to make you successful in your work?',
+      'As a supervisor, it is essential to motivate employees in your area. Sometimes this must be done using non-monetary means. Please describe some creative ways you have motivated and recognized employees in the past non-monetarily.',
+      'Explain, step by step, how you have coached an employee who had performance problems.',
+      'If you had to describe your own leadership style as directive, delegating, or coaching, which would you choose? Please explain why giving examples.',
+    ],
+  },
+  {
+    key: 'optional_situational',
+    title: 'E. Optional Situational Questions',
+    instruction: 'Please explain how you would handle the following situations:',
+    questions: [
+      'You observe two of your employees arguing in a central location in the office.',
+      'One of your employees comes to you complaining about another employee and insisting they should no longer work together.',
+      'One of your employees comes to you to complain that he/she has a more demanding work load than another employee and wants the workload to be shifted.',
+    ],
+  },
+  {
+    key: 'general',
+    title: 'F. General',
+    questions: [
+      'Could you share with us a recent accomplishment of which you are most proud?',
+      'Tell us a bit about your work background, and then give us a description of how you think it relates to our current opening.',
+      'Why have you applied for this position?',
+      'What skill set do you think you would bring to this position?',
+      'Tell me about your present or last job. Why did you choose it? Why did you/do you want to leave?',
+      'What was your primary contribution/achievement? Biggest challenge?',
+      'What are your short-term and long-term goals?',
+      'In what areas would you like to develop further? What are your plans to do that?',
+      'What are some positive aspects of your last employment/employer? What are some negative aspects?',
+      'What do you know about our company?',
+      'Why should we hire YOU?',
+      'After learning about this opportunity, what made you take the next step and apply for the job?',
+      'If you are the successful applicant, how would you expect to be different after a year in this position?',
+      'Now that you have learned about our company and the position you are applying for, what hesitation or reluctance would you have in accepting this job if we offer it to you?',
+    ],
+  },
+]
+const ACADEMIC_ACTIVITY_NINE_MOCK_QUESTION_FIELDS = ACADEMIC_ACTIVITY_NINE_QUESTION_GROUPS
+  .flatMap((group) => group.questions.map((question, index) => ({
+    key: `mock_${group.key}_${index + 1}`,
+    label: question,
+    rows: 5,
+  })))
+
+const ACADEMIC_PORTFOLIO_SECTIONS = [
+  {
+    group: 'STUDENT INFORMATION SHEET',
+    section: ACADEMIC_STUDENT_INFORMATION_SECTION,
+    title: 'STUDENT INFORMATION SHEET',
+    description: 'Complete your student information sheet and personal reflections.',
+    fields: [
+      { key: 'name', label: 'Name', type: 'text' },
+      { key: 'birth_date', label: 'Date of Birth', type: 'date' },
+      { key: 'parent_guardian_name', label: 'Parent’s / Guardian’s Name', type: 'text' },
+      { key: 'email', label: 'E-mail Address', type: 'email' },
+      { key: 'cellphone_number', label: 'Cellphone Number', type: 'tel' },
+      { key: 'religion', label: 'Religion', type: 'text' },
+      { key: 'hobbies', label: 'Hobbies / Past Time Activities', rows: 3 },
+      { key: 'skills_talents', label: 'Skills / Talents', rows: 3 },
+      { key: 'feelings_about_school', label: 'How do you feel about school?', rows: 3 },
+      { key: 'memorable_subject', label: 'What are your most memorable subject / class? Why?', rows: 4 },
+      { key: 'plans_after_senior_high', label: 'What are your plans after Senior High School?', rows: 4 },
+      { key: 'career_path', label: 'What is your career path?', rows: 4 },
+      { key: 'life_philosophy', label: 'What is your philosophy in life?', rows: 4 },
+      { key: 'plans_abroad', label: 'Do you have plans to go abroad? If yes, where and why?', rows: 4 },
+      { key: 'dreams_ambitions', label: 'What are your dreams and ambitions?', rows: 4 },
+      { key: 'achieving_ambitions', label: 'How do you plan to achieve your ambitions and goals in life?', rows: 4 },
+      { key: 'work_immersion_expectations', label: 'What are your expectations and apprehensions for work immersion?', rows: 4 },
+    ],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: ACADEMIC_PRE_IMMERSION_ACTIVITY_ONE_SECTION,
+    title: 'PRE-IMMERSION',
+    description: 'Before we immerse into the work place we will first understand the immersion process, proper work ethics, workplace safety, confidentiality, and effective conflict resolution and teamwork skills, as agreed in the DepEd Order No. 30 s. 2017. Also, we need to hone our skills in writing a resume, filling of application forms, and complying requirements.',
+    fields: [{ key: 'worker_reflection', label: 'Your reflection', rows: 14 }],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: ACADEMIC_PRE_IMMERSION_ACTIVITY_TWO_SECTION,
+    title: 'ACTIVITY 2',
+    description: 'After the pre-immersion orientation, list the Do’s and Don’ts employed in the workplace you are assigned.',
+    fields: [
+      ...ACADEMIC_PRE_IMMERSION_ACTIVITY_TWO_ROWS.flatMap(({ number, dosKey, dontsKey }) => [
+        { key: dosKey, label: `DO’s row ${number}` },
+        { key: dontsKey, label: `DON’Ts row ${number}` },
+      ]),
+      { key: 'policy_reflection', label: 'Policy guidelines reflection' },
+      { key: 'unacceptable_rule_reflection', label: 'Unacceptable rule reflection' },
+    ],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: ACADEMIC_PRE_IMMERSION_ACTIVITY_THREE_SECTION,
+    title: 'ACTIVITY 3 | Situational Analysis',
+    description: 'Respond to the confidentiality situation.',
+    fields: [{ key: 'situational_analysis_answer', label: 'Your answer', rows: 16 }],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: 'Academic Portfolio/Pre-Immersion/Confidentiality in the Workplace',
+    title: 'Confidentiality in the Workplace',
+    description: 'Explain how you will protect private information in a work setting.',
+    fields: [
+      { key: 'confidential_information', label: 'Examples of confidential information', rows: 3 },
+      { key: 'confidentiality_practices', label: 'How to protect workplace confidentiality', rows: 4 },
+      { key: 'reflection', label: 'Personal commitment', rows: 3 },
+    ],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: ACADEMIC_PRE_IMMERSION_ACTIVITY_FOUR_SECTION,
+    title: 'ACTIVITY 4 | Conflict Resolution',
+    description: 'Did you ever experience disagreement and conflict with co-workers? How did you handle the situation? How would you rate your skills in handling differences of opinion? Please give an example that illustrates that skill.',
+    fields: [{ key: 'conflict_resolution_answer', label: 'Your answer', rows: 16 }],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: ACADEMIC_PRE_IMMERSION_ACTIVITY_FIVE_SECTION,
+    title: 'ACTIVITY 5 | RESUME WRITING',
+    description: 'Please attach your resume here.',
+    fields: [{ key: 'resume', label: 'Resume' }],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: ACADEMIC_PRE_IMMERSION_ACTIVITY_SIX_SECTION,
+    title: 'ACTIVITY 6 | APPLICATION LETTER',
+    description: 'Write and compose your own application letter.',
+    fields: [{ key: 'letter_draft', label: 'APPLICATION LETTER', rows: 16 }],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: ACADEMIC_PRE_IMMERSION_ACTIVITY_SEVEN_SECTION,
+    title: 'ACTIVITY 7 / CLEARANCES',
+    description: 'Give the process and fees required for a BARANGAY CLEARANCE. Attach also your BARANGAY CLEARANCE.',
+    fields: [
+      ...ACADEMIC_PRE_IMMERSION_CLEARANCE_STEPS.map(({ key, number }) => ({
+        key,
+        label: `Step ${number}`,
+        rows: 3,
+      })),
+      { key: 'clearance_file', label: 'Barangay Clearance file' },
+    ],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: ACADEMIC_PRE_IMMERSION_ACTIVITY_EIGHT_SECTION,
+    title: 'ACTIVITY 8 / MEDICAL CERTIFICATE',
+    description: 'Give the process and fees required for a MEDICAL CERTIFICATE. Attach also your MEDICAL CERTIFICATE.',
+    fields: [
+      ...ACADEMIC_PRE_IMMERSION_CLEARANCE_STEPS.map(({ key, number }) => ({
+        key,
+        label: `Step ${number}`,
+        rows: 3,
+      })),
+      { key: 'medical_certificate_file', label: 'Medical Certificate file' },
+    ],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: 'Academic Portfolio/Pre-Immersion/Activity 9 - Job Interview',
+    title: 'ACTIVITY 9 / JOB INTERVIEW',
+    description: 'A job interview is an interview consisting of a conversation between a job applicant and a representative of an employer which is conducted to assess whether the applicant should be hired. How you answer questions during job interview can have a big impact on you being hired or accepted as a work immerse. Jot down questions that you have come across during your first dialogue with the partner-industry work supervisor or head of office you will be assigned.',
+    fields: [
+      { key: 'interview_question', label: 'Questions encountered during the first dialogue', rows: 10 },
+      ...ACADEMIC_ACTIVITY_NINE_MOCK_QUESTION_FIELDS,
+    ],
+  },
+  {
+    group: 'PRE-IMMERSION',
+    section: 'Academic Portfolio/Pre-Immersion/Activity 10 - Mock Job Interview',
+    title: 'ACTIVITY 10 | MOCK JOB INTERVIEW',
+    description: '',
+    fields: [
+      {
+        key: 'performance_reflection',
+        label: '1. During the conduct of the mock job interview, do you think you did well?',
+        rows: 8,
+      },
+      {
+        key: 'skills_demonstrated',
+        label: '2. What are the areas that you think you are good at and areas that needed to be improved?',
+        rows: 8,
+      },
+      {
+        key: 'improvement_plan',
+        label: '3. Are you more confident now to answer during job interview?',
+        rows: 8,
+      },
+    ],
+  },
+  {
+    group: 'IMMERSION PROPER',
+    section: 'Academic Portfolio/Immersion Proper/Activity 11 - Attach Insurance Policy',
+    title: 'ACTIVITY 11 | Attach Insurance Policy here',
+    description: '',
+    fields: [{ key: 'insurance_policy', label: 'Insurance Policy' }],
+  },
+  {
+    group: 'IMMERSION PROPER',
+    section: "Academic Portfolio/Immersion Proper/Activity 12 - Parents' Consent Form",
+    title: 'ACTIVITY 12 | Parents’ Consent Form',
+    description: 'A parent’s consent form is a document signed by parents or legal guardians that grants permission for a student to undergo Work Immersion.',
+    fields: [
+      { key: 'parents_permit', label: 'Parents Permit' },
+      { key: 'consent_name_of_school', label: 'Name of School', type: 'text' },
+      { key: 'consent_student_birth_date', label: 'Date of Birth', type: 'date' },
+      { key: 'consent_school', label: 'School', type: 'text' },
+      { key: 'parent_guardian_name', label: 'Name of Parent/Guardian', type: 'text' },
+      { key: 'consent_parent_address', label: 'Address', rows: 2 },
+      { key: 'consent_parent_contact', label: 'Contact Number', type: 'tel' },
+      { key: 'consent_medical_conditions', label: 'Medical conditions/allergies', type: 'text' },
+      { key: 'consent_medication_details', label: 'Please provide details of medication that must be administered, if any:', rows: 4 },
+      { key: 'consent_signature_name', label: 'Signature Over Printed Name of Parent/Guardian', type: 'text' },
+      { key: 'consent_date', label: 'Date', type: 'date' },
+    ],
+  },
+  {
+    group: 'IMMERSION PROPER',
+    section: 'Academic Portfolio/Immersion Proper/The Company',
+    title: 'THE COMPANY',
+    description: 'Appreciating management processes by observing, identifying and describing the following:',
+    fields: [
+      { key: 'nature_of_business', label: '1. Nature of the business', rows: 5 },
+      { key: 'products_services_description', label: '2. Description of the products/services', rows: 5 },
+      { key: 'target_clientele', label: '3. Target clientele', rows: 5 },
+      { key: 'company_organizational_structure', label: '4. Organizational structure', rows: 5 },
+      { key: 'company_rules_regulations', label: '5. Company rules and regulations', rows: 5 },
+    ],
+  },
+  {
+    group: 'IMMERSION PROPER',
+    section: 'Academic Portfolio/Immersion Proper/Activity 13 - Profile of the Company',
+    title: 'ACTIVITY 13 | Profile of the Company/Establishment',
+    description: '',
+    fields: [
+      { key: 'company_profile', label: 'Student’s Company Profile', rows: 12 },
+      { key: 'company_profile_images', label: 'Work immersion area pictures' },
+      { key: 'company_vision', label: 'Vision', rows: 6 },
+      { key: 'company_mission', label: 'Mission', rows: 6 },
+      { key: 'company_objectives', label: 'Objectives', rows: 6 },
+      { key: 'company_core_values', label: 'Core Values', rows: 6 },
+    ],
+  },
+  {
+    group: 'IMMERSION PROPER',
+    section: 'Academic Portfolio/Immersion Proper/Activity 14 - Organizational Chart',
+    title: 'Activity 14 – Organizational Chart',
+    description: 'Describe the organization structure and attach a chart if available.',
+    fields: [
+      { key: 'departments_and_roles', label: 'Departments and roles', rows: 5 },
+      { key: 'reporting_relationships', label: 'Reporting relationships', rows: 3 },
+    ],
+  },
+  {
+    group: 'IMMERSION PROPER',
+    section: 'Academic Portfolio/Immersion Proper/Activity 15 - Work Immersion Tasks',
+    title: 'ACTIVITY 15 | Work Immersion Task/s Activities',
+    description: 'Record each task or activity completed during work immersion.',
+    fields: [
+      { key: 'task_entries', label: 'Work Immersion tasks and activities' },
+      { key: 'task_evidence_images', label: 'Supporting photos or evidence' },
+    ],
+  },
+  {
+    group: 'IMMERSION PROPER',
+    section: 'Academic Portfolio/Immersion Proper/Activity 16 - Narrative Report',
+    title: 'ACTIVITY 16 | NARRATIVE REPORT',
+    description: 'Describe your work immersion experience.',
+    fields: [
+      { key: 'introduction', label: 'Introduction', rows: 5 },
+      { key: 'activities_performed', label: 'Activities Performed', rows: 6 },
+      { key: 'skills_knowledge_gained', label: 'Skills and Knowledge Gained', rows: 5 },
+      { key: 'challenges_encountered', label: 'Challenges Encountered', rows: 5 },
+      { key: 'learning_experiences', label: 'Learning Experiences', rows: 5 },
+      { key: 'conclusion', label: 'Conclusion', rows: 5 },
+      { key: 'narrative_evidence', label: 'Photos, illustrations, and other evidence' },
+    ],
+  },
+  {
+    group: 'IMMERSION PROPER',
+    section: 'Academic Portfolio/Immersion Proper/Activity 17 - Civil Service Form No. 48',
+    title: 'ACTIVITY 17 | Civil Service Form No. 48',
+    description: '',
+    fields: [{ key: 'civil_service_form', label: 'Civil Service Form No. 48 — Daily Time Record' }],
+  },
+  {
+    group: 'POST-IMMERSION',
+    section: 'Academic Portfolio/Post-Immersion/Activity 18 - Post-Immersion',
+    title: 'ACTIVITY 18 | Post-Immersion',
+    description: '',
+    fields: [
+      { key: 'memorable_experiences', label: 'Memorable Experiences', rows: 5 },
+      { key: 'key_learnings', label: 'Key Learnings', rows: 5 },
+      { key: 'personal_professional_development', label: 'Personal and Professional Development', rows: 5 },
+      { key: 'confidence_future_readiness', label: 'Confidence and Future Readiness', rows: 5 },
+      { key: 'work_immersion_collage', label: 'Work Immersion Photo Collage' },
+    ],
+  },
+  {
+    group: 'POST-IMMERSION',
+    section: 'Academic Portfolio/Post-Immersion/Activity 19 - My Reflections',
+    title: 'ACTIVITY 19 | MY REFLECTIONS',
+    description: '',
+    fields: [{ key: 'work_immersion_reflection', label: 'How did the experience change me as a person, and how will it help me in the future?', rows: 12 }],
+  },
+  {
+    group: 'ASSESSMENT',
+    section: 'Academic Portfolio/Assessment/Performance Assessment Form',
+    title: 'ASSESSMENT',
+    description: '',
+    fields: [
+      { key: 'assessment_ratings', label: 'Performance ratings' },
+      { key: 'assessment_feedback', label: 'Teacher and supervisor feedback' },
+    ],
+  },
+  {
+    group: 'REFERENCES',
+    section: 'Academic Portfolio/References/Character References',
+    title: 'REFERENCES',
+    description: '',
+    fields: [],
+  },
+]
+
+const ACADEMIC_ASSESSMENT_RATING_SCALE = [
+  '(10) - Excellent',
+  '(9) - Very Good',
+  '(8) - Good',
+  '(7) - Fair',
+  '(6) - Poor Performance',
+]
+
+const ACADEMIC_ASSESSMENT_FORMS = [
+  {
+    key: 'pre-immersion',
+    title: 'I. PRE-IMMERSION',
+    objectivesTitle: 'Objectives: Understanding work immersion by discussing:',
+    objectives: [
+      { heading: 'A. Expected Behaviour:', items: ['Work ethics', 'Safety in the workplace', 'Workplace rights and responsibilities', 'Confidentiality in the workplace', 'Effective conflict resolution and teamwork skills'] },
+      { heading: 'B. Appreciating the importance of credentials by:', items: ['Writing a resume', 'Filling out application forms', 'Securing clearances', 'Job interview skills training'] },
+    ],
+    indicatorTitle: 'Performance Indicator:',
+    note: '*To be rated by the Work Immersion Teacher and should be indicated in the Written Works 1',
+    columns: ['Competency', 'Activity No.', 'Task/Output/Artefact', '10', '9', '8', '7', '6', 'WI Teacher'],
+    rows: [
+      ['A. Work ethics', '1', 'The Worker (Essay)'],
+      ['Safety in the workplace', '2', 'Do’s & Don’ts'],
+      ['Confidentiality in the workplace', '3', 'Confidentiality in the Workplace'],
+      ['Effective conflict resolution', '4', 'Conflict Resolution'],
+      ['B. Writing a resume', '5', 'Sample Resume'],
+      ['Filling out application forms', '6', 'Application Letter'],
+      ['Secure clearances', '7, 8, 8, 10', 'Barangay, Police, Mayor’s Clearance, Medical Certificate'],
+      ['Job interview skills', '11', 'Job Interview'],
+      ['Other documents', '12, 13', 'Insurance Policy, Parent’s Consent'],
+    ],
+    perfectScore: '130',
+    feedback: ['Feedback of Work Immersion Teacher:', 'Name and Signature of Work Immersion Teacher'],
+  },
+  {
+    key: 'immersion-objectives',
+    title: 'II. IMMERSION PROPER',
+    subtitle: 'A. Objectives',
+    objectivesText: 'Appreciating management processes by observing, identifying and describing the following:',
+    objectiveItems: ['Nature of the business', 'Description of the products/services', 'Target clientele', 'Organizational structure', 'Company rules and regulations'],
+    indicatorTitle: 'Skills Indicator:',
+    note: '*To be rated by the Work Immersion Partner Institution Supervisor and Work Immersion Teacher, to be indicated in the Performance Task 1',
+    columns: ['Competency', 'Activity No.', 'Task/Output/Artefact', '10', '9', '8', '7', '6', 'Supervisor', 'Teacher'],
+    rows: [
+      ['Nature of the business', '14', 'Written narrative on company profile'],
+      ['Description of the products/services', '14', 'Pictures of products/services or written narrative on activities performed'],
+      ['Target clientele', '14', 'Business profile'],
+      ['Organizational structure', '15', 'Organizational chart'],
+      ['Company rules & regulations', '16', 'Company handbook or list of rules & regulations'],
+    ],
+    ratingResponsibility: ['Supervisor: 60%', 'Teacher: 40%'],
+    perfectScore: '50',
+    feedback: ['What went well?', 'What needs to be improved?', 'Feedback of Supervisor:', 'Name and Signature of Supervisor', 'Feedback of Work Immersion Teacher:', 'Name and Signature of Immersion Teacher'],
+  },
+  {
+    key: 'business-processes',
+    title: 'B. IMMERSION PROPER — BUSINESS PROCESSES',
+    objectivesTitle: 'Objectives:',
+    objectivesText: 'Appreciating business processes by observing and participating in Safety / Production / Maintenance / Quality Control / Quality Assurance / Customer Satisfaction / Housekeeping / Hygiene and others',
+    indicatorTitle: 'Skills Indicator:',
+    note: '*To be rated by the Work Immersion Partner Institution Supervisor and Work Immersion Teacher, indicated in the Performance Task 2',
+    columns: ['Competency', 'Activity No.', 'Performance Task/Output/Artefact', '10', '9', '8', '7', '6', 'Supervisor 60%', 'Teacher 40%'],
+    rows: [
+      ['Safety / Production / Maintenance / Quality Control / Quality Assurance / Customer Satisfaction / Housekeeping / Hygiene and others', '17', 'Written narrative on business processes of the company (may contain photos & charts)'],
+      ['Same competency', '18', 'Written report on activities performed'],
+      ['Same competency', '19', 'Business process flow chart'],
+    ],
+    perfectScore: '30',
+    feedback: ['What went well?', 'What needs to be improved?', 'Feedback of Supervisor:', 'Name and Signature of Supervisor', 'Feedback of Work Immersion Teacher:', 'Name and Signature of Immersion Teacher'],
+  },
+  {
+    key: 'applying-skills',
+    title: 'C. APPLYING SKILLS LEARNED AND PROPER VALUES',
+    objectivesTitle: 'Objectives:',
+    objectivesText: 'Applying skills learned and proper values acquired in school.',
+    indicatorTitle: 'Skills Indicator:',
+    note: 'To be rated by the Work Immersion Partner Institution Supervisor and Work Immersion Teacher, to be indicated in the Performance Task 3',
+    columns: ['Competency', 'Activity No.', 'Task/Output/Artefact', '10', '9', '8', '7', '6', 'Supervisor 60%', 'Teacher 40%'],
+    rows: [
+      ['Applying skills learned and proper values acquired in school', '20', 'Daily Time Record'],
+      ['Same competency', '21', 'Daily Task Record or Daily Diary/Journal'],
+      ['Same competency', '22', 'Photos, illustrations of performed hands-on skills; Work Performance (includes knowledge and quality of work)'],
+      ['Same competency', '23', 'Personal Traits 1 (based on pleasing appearance, courtesy, conduct, industriousness, and reliability)'],
+      ['Same competency', '24', 'Personal Trait 2 (based on sociability, drive and leadership, mental maturity and stress tolerance)'],
+      ['Same competency', '25', 'Other related tasks'],
+    ],
+    perfectScore: '60',
+    feedback: ['What went well?', 'What needs to be improved?', 'Feedback of Supervisor:', 'Name and Signature of Supervisor', 'Feedback of Work Immersion Teacher:', 'Name and Signature of Immersion Teacher'],
+  },
+  {
+    key: 'post-work-immersion',
+    title: 'III. POST WORK IMMERSION',
+    objectivesTitle: 'Objectives: Evaluating the Work Immersion Experience',
+    indicatorTitle: 'Skills Indicator:',
+    note: '*To be rated by the Work Immersion Teacher and should be indicated in the Written Works 2',
+    columns: ['Competency', 'Activity No.', 'Task/Output/Artefact', '10', '9', '8', '7', '6', 'Teacher'],
+    rows: [
+      ['Presenting a portfolio with entries', '26', 'Accomplished forms, Collage'],
+      ['Comparing school and work application of skills, knowledge, and attitude', '27', 'Accomplishment Report and/or Weekly diary (issues faced & resolutions)'],
+      ['Writing an updated resume', '28', 'Updated Resume'],
+      ['Reflecting on experiences', '29', 'Work Immersion Highlights'],
+      ['Reflecting on experiences', '30', 'Reflections'],
+      ['Completion Certificate', '—', 'Completion Certificate'],
+    ],
+    perfectScore: '40',
+    feedback: ['What went well?', 'What needs to be improved?', 'Feedback of Supervisor:', 'Name and Signature of Supervisor', 'Feedback of Work Immersion Teacher:', 'Name and Signature of Work Immersion Teacher'],
+  },
+]
+
+function parseAcademicPortfolioContent(content) {
+  if (typeof content === 'string') {
+    try {
+      const parsed = JSON.parse(content)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    } catch {
+      return {}
+    }
+  }
+  return content && typeof content === 'object' && !Array.isArray(content) ? content : {}
+}
+
+const getPortfolioFilePaths = (value) => (
+  Array.isArray(value) ? value.map((file) => file?.path || '') : []
+)
+
+function getAcademicStudentInformationFieldValue(content, key) {
+  const legacyKeys = {
+    name: 'full_name',
+    parent_guardian_name: 'parent_guardian',
+    cellphone_number: 'contact_number',
+  }
+  const legacyKey = legacyKeys[key]
+  return content[key] ?? (legacyKey ? content[legacyKey] : undefined) ?? ''
+}
+
+function isAcademicPortfolioSectionComplete(section, content) {
+  const savedContent = parseAcademicPortfolioContent(content)
+
+  if (section.section.endsWith('Activity 15 - Work Immersion Tasks')) {
+    const taskEntries = Array.isArray(savedContent.task_entries) ? savedContent.task_entries : []
+    const requiredTaskFields = ['date', 'task', 'description', 'skills_knowledge', 'learning_gained']
+    const enteredTasks = taskEntries.filter((task) => (
+      requiredTaskFields.some((field) => hasSavedPortfolioAnswer(task?.[field]))
+    ))
+    return enteredTasks.length > 0 && enteredTasks.every((task) => (
+      requiredTaskFields.every((field) => hasSavedPortfolioAnswer(task?.[field]))
+    ))
+  }
+
+  if (section.section.endsWith('Activity 16 - Narrative Report')) {
+    return [
+      'introduction',
+      'activities_performed',
+      'skills_knowledge_gained',
+      'challenges_encountered',
+      'learning_experiences',
+      'conclusion',
+    ].every((field) => hasSavedPortfolioAnswer(savedContent[field]))
+  }
+
+  if (section.section.endsWith('Activity 17 - Civil Service Form No. 48')) {
+    return hasSavedPortfolioAnswer(savedContent.civil_service_form_ref?.path)
+  }
+
+  if (section.section.endsWith('Activity 18 - Post-Immersion')) {
+    return [
+      'memorable_experiences',
+      'key_learnings',
+      'personal_professional_development',
+      'confidence_future_readiness',
+    ].every((field) => hasSavedPortfolioAnswer(savedContent[field]))
+      && getPortfolioFilePaths(savedContent.work_immersion_collage).length > 0
+  }
+
+  if (section.section.endsWith('Activity 19 - My Reflections')) {
+    return hasSavedPortfolioAnswer(savedContent.work_immersion_reflection)
+  }
+
+  if (section.section === 'Academic Portfolio/Assessment/Performance Assessment Form') {
+    return ACADEMIC_ASSESSMENT_FORMS.every((form) => (
+      form.rows.every((_, rowIndex) => (
+        hasSavedPortfolioAnswer(savedContent.assessment_ratings?.[form.key]?.[rowIndex])
+      ))
+      && form.feedback.every((_, feedbackIndex) => (
+        hasSavedPortfolioAnswer(savedContent.assessment_feedback?.[`${form.key}-${feedbackIndex}`])
+      ))
+    ))
+  }
+
+  return section.fields.length > 0 && section.fields.every((field) => (
+    hasSavedPortfolioAnswer(savedContent[field.key])
+  ))
+}
+
+const ACADEMIC_PROGRESS_GROUPS = [
+  'STUDENT INFORMATION SHEET',
+  'PRE-IMMERSION',
+  'IMMERSION PROPER',
+  'POST-IMMERSION',
+  'ASSESSMENT',
+]
+
+function getAcademicPortfolioProgress(entries) {
+  const portfolioEntries = entries && typeof entries === 'object' && !Array.isArray(entries)
+    ? entries
+    : {}
+  const groupedProgress = new Map(ACADEMIC_PROGRESS_GROUPS.map((group) => [
+    group,
+    { title: group, completed: 0, total: 0, activities: [] },
+  ]))
+  ACADEMIC_PORTFOLIO_SECTIONS.forEach((section) => {
+    const group = groupedProgress.get(section.group)
+    if (!group) return
+    const completed = isAcademicPortfolioSectionComplete(
+      section,
+      portfolioEntries[section.section]
+    )
+    group.completed += Number(completed)
+    group.total += 1
+    group.activities.push({
+      section: section.section,
+      completed,
+    })
+  })
+  const groups = [...groupedProgress.values()]
+  const activities = groups.flatMap((group) => group.activities)
+  const totalSections = groups.reduce((total, group) => total + group.total, 0)
+  const completedSections = groups.reduce((total, group) => total + group.completed, 0)
+  const studentActivities = activities.filter((activity) => (
+    !activity.section.startsWith('Academic Portfolio/Assessment/')
+  ))
+  const completedStudentActivities = studentActivities.filter((activity) => activity.completed).length
+
+  return {
+    groups,
+    completedActivities: activities.filter((activity) => activity.completed).length,
+    totalActivities: activities.length,
+    totalSections,
+    completedSections,
+    percentage: totalSections ? Math.round((completedSections / totalSections) * 100) : 0,
+    canSubmit: studentActivities.length > 0
+      && completedStudentActivities === studentActivities.length,
+  }
+}
+
+const ACADEMIC_PORTFOLIO_GROUPS = [
+  'STUDENT INFORMATION SHEET',
+  'PRE-IMMERSION',
+  'IMMERSION PROPER',
+  'POST-IMMERSION',
+  'ASSESSMENT',
+  'REFERENCES',
+]
+const ACADEMIC_STUDENT_PROGRESS_GROUPS = [
+  { title: 'Student Information Sheet', group: 'STUDENT INFORMATION SHEET' },
+  { title: 'Pre-Immersion', group: 'PRE-IMMERSION' },
+  { title: 'Immersion Proper', group: 'IMMERSION PROPER' },
+  { title: 'Post-Immersion', group: 'POST-IMMERSION' },
+  { title: 'Assessment', group: 'ASSESSMENT' },
+].map(({ title, group }) => ({
+  title,
+  modules: ACADEMIC_PORTFOLIO_SECTIONS
+    .filter((section) => section.group === group)
+    .map((section) => ({
+      title: section.title,
+      section: section.section,
+      fields: section.fields.map((field) => field.key),
+    })),
+}))
+
+function getAcademicStudentProgress(entries) {
+  const groups = ACADEMIC_STUDENT_PROGRESS_GROUPS.map((group) => {
+    const completed = group.modules.filter((module) => (
+      isAcademicPortfolioSectionComplete(
+        ACADEMIC_PORTFOLIO_SECTIONS.find((section) => section.section === module.section),
+        entries[module.section],
+      )
+    )).length
+    return { ...group, completed, total: group.modules.length }
+  })
+  const totalSections = groups.reduce((total, group) => total + group.total, 0)
+  const completedSections = groups.reduce((total, group) => total + group.completed, 0)
+  return {
+    groups,
+    totalSections,
+    completedSections,
+    percentage: totalSections ? Math.round((completedSections / totalSections) * 100) : 0,
+  }
+}
+
+function useAcademicPortfolioEntries(user) {
+  const [entries, setEntries] = useState({})
+  const [savedEntries, setSavedEntries] = useState({})
+  const [loading, setLoading] = useState(true)
+  const [errorMessage, setErrorMessage] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const loadEntries = async () => {
+      if (!user?.id || !isAcademicStrand(user?.strand)) {
+        setEntries({})
+        setSavedEntries({})
+        setLoading(false)
+        return
+      }
+
+      setLoading(true)
+      setErrorMessage('')
+      try {
+        let savedEntries
+        if (navigator.onLine) {
+          const { data, error } = await supabase
+            .from('portfolio_entries')
+            .select('section,content,updated_at')
+            .eq('user_id', user.id)
+            .like('section', 'Academic Portfolio/%')
+          if (error) throw error
+
+          savedEntries = Object.fromEntries(
+            (data || []).map((entry) => [
+              entry.section,
+              parseAcademicPortfolioContent(entry.content),
+            ])
+          )
+          const pendingEntries = await getPendingSync(user.id)
+          pendingEntries.forEach((item) => {
+            if (
+              item.type === 'portfolio-upsert' &&
+              item.row?.section?.startsWith('Academic Portfolio/')
+            ) {
+              savedEntries[item.row.section] = parseAcademicPortfolioContent(item.row.content)
+            }
+          })
+          await Promise.all((data || []).map((entry) => (
+            savePortfolioCache(user.id, entry.section, entry.content, entry.updated_at)
+              .catch((cacheError) => {
+                console.error('Cache academic portfolio entry failed:', cacheError)
+              })
+          )))
+        } else {
+          const cachedEntries = await getPortfolioEntriesCache(user.id)
+          savedEntries = Object.fromEntries(
+            cachedEntries
+              .filter((entry) => entry.section.startsWith('Academic Portfolio/'))
+              .map((entry) => [
+                entry.section,
+                parseAcademicPortfolioContent(entry.content),
+              ])
+          )
+        }
+        if (!cancelled) {
+          setEntries(savedEntries)
+          setSavedEntries(savedEntries)
+        }
+      } catch (error) {
+        console.error('Load academic portfolio failed:', error)
+        if (!cancelled) {
+          let academicEntries = []
+          try {
+            const cachedEntries = await getPortfolioEntriesCache(user.id)
+            academicEntries = cachedEntries.filter((entry) => (
+              entry.section.startsWith('Academic Portfolio/')
+            ))
+          } catch (cacheError) {
+            console.error('Load academic portfolio cache failed:', cacheError)
+          }
+          if (!academicEntries.length) {
+            setErrorMessage(error?.message || 'Could not load your academic portfolio.')
+          } else {
+            const fallbackEntries = Object.fromEntries(
+              academicEntries.map((entry) => [
+                entry.section,
+                parseAcademicPortfolioContent(entry.content),
+              ])
+            )
+            setEntries(fallbackEntries)
+            setSavedEntries(fallbackEntries)
+          }
+        }
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+
+    loadEntries()
+    return () => { cancelled = true }
+  }, [user?.id, user?.strand])
+
+  return { entries, savedEntries, loading, errorMessage, setEntries, setSavedEntries }
+}
+
+function AcademicProgress({ user }) {
+  const { entries, loading, errorMessage } = useAcademicPortfolioEntries(user)
+  const progress = getAcademicStudentProgress(entries)
+
   return (
     <div className="dashboard-section">
-      <p className="eyebrow">
-        STUDENT DASHBOARD / PROGRESS
-      </p>
-      <h1>Progress</h1>
-      <p>Academic progress tracking is not available yet.</p>
+      <p className="eyebrow">STUDENT DASHBOARD / PROGRESS</p>
+      <h1>Portfolio Progress</h1>
+      <p>Track your progress as you complete your Work Immersion portfolio.</p>
       <div className="progress-overview-card">
         <div className="progress-overview-header">
           <div>
             <span className="eyebrow">OVERALL PROGRESS</span>
-            <h2>Academic Progress</h2>
+            <h2>Portfolio Completion</h2>
           </div>
-          <strong>—</strong>
+          <strong>{loading ? '…' : `${progress.percentage}%`}</strong>
         </div>
         <div className="progress-bar">
-          <div className="progress-fill" style={{ width: '0%' }} />
+          <div className="progress-fill" style={{ width: `${loading ? 0 : progress.percentage}%` }} />
+        </div>
+        <div className="progress-stats">
+          <span>Completed sections: <strong>{loading ? '…' : progress.completedSections}</strong></span>
+          <span>Remaining sections: <strong>{loading ? '…' : progress.totalSections - progress.completedSections}</strong></span>
         </div>
       </div>
+      {loading && <p role="status">Loading portfolio progress...</p>}
+      {errorMessage && <p role="alert" className="workplace-essay-message error">{errorMessage}</p>}
+      <div className="progress-module-list">
+        {progress.groups.map((group) => (
+          <ProgressModule
+            key={group.title}
+            title={group.title}
+            completed={group.completed}
+            total={group.total}
+          />
+        ))}
+      </div>
+      {!loading && !errorMessage && progress.totalSections === 0 && (
+        <p>Academic portfolio requirements will appear here when they are added.</p>
+      )}
     </div>
   )
+}
+
+function AcademicPortfolio({ user }) {
+  const {
+    entries,
+    savedEntries,
+    loading,
+    errorMessage,
+    setEntries,
+    setSavedEntries,
+  } = useAcademicPortfolioEntries(user)
+  const [selectedSectionKey, setSelectedSectionKey] = useState('')
+  const [savingSection, setSavingSection] = useState('')
+  const [uploadingSection, setUploadingSection] = useState('')
+  const [studentPhotoFile, setStudentPhotoFile] = useState(null)
+  const [saveMessage, setSaveMessage] = useState('')
+  const [saveError, setSaveError] = useState('')
+  const [editingSectionKey, setEditingSectionKey] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [submissionMessage, setSubmissionMessage] = useState('')
+  const [submissionError, setSubmissionError] = useState('')
+  const [downloadingPdf, setDownloadingPdf] = useState(false)
+  const progress = getAcademicPortfolioProgress(savedEntries)
+
+  useEffect(() => {
+    const previewUrl = studentPhotoFile?.previewUrl
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl)
+    }
+  }, [studentPhotoFile])
+
+  const updateField = (section, field, value) => {
+    setEntries((previous) => ({
+      ...previous,
+      [section]: { ...(previous[section] || {}), [field]: value },
+    }))
+    setSaveMessage('')
+    setSubmissionMessage('')
+  }
+
+  const saveSection = async (section, content = entries[section] || {}) => {
+    if (!user?.id) {
+      setSaveError('Your account could not be identified. Please log in again.')
+      return false
+    }
+
+    setSavingSection(section)
+    setSaveError('')
+    setSaveMessage('')
+    try {
+      const { error, queued } = await savePortfolioEntry(supabase, {
+        user_id: user.id,
+        section,
+        content,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id,section' })
+      if (error) throw error
+      setSavedEntries((previous) => ({
+        ...previous,
+        [section]: parseAcademicPortfolioContent(content),
+      }))
+      setSaveMessage(queued
+        ? 'Your changes are saved on this device and queued to sync.'
+        : 'Your changes are saved.')
+      return true
+    } catch (error) {
+      console.error('Save academic portfolio section failed:', error)
+      setSaveError(error?.message || 'Could not save your portfolio section.')
+      return false
+    } finally {
+      setSavingSection('')
+    }
+  }
+
+  const saveSelectedSection = async (section) => {
+    const saved = await saveSection(section)
+    if (saved) setEditingSectionKey('')
+  }
+
+  const uploadAttachment = async (section, event) => {
+    const file = event.target.files?.[0]
+    const selectedAt = event.timeStamp
+    event.target.value = ''
+    if (!file || !user?.id) return
+
+    setUploadingSection(section.section)
+    setSaveError('')
+    setSaveMessage('')
+    let uploadedPath = ''
+    try {
+      const sectionSlug = section.title
+        .normalize('NFKD')
+        .replace(/[^\w.-]+/g, '-')
+        .replace(/^-|-$/g, '')
+      const safeFileName = file.name.replace(/[^\w.-]+/g, '-')
+      const fileId = `${file.lastModified}-${Math.round(selectedAt)}`
+      uploadedPath = `${user.id}/academic/${sectionSlug}/${fileId}-${safeFileName}`
+      const { error: uploadError } = await supabase.storage
+        .from('portfolio-files')
+        .upload(uploadedPath, file, {
+          upsert: false,
+          contentType: file.type || 'application/octet-stream',
+        })
+      if (uploadError) throw uploadError
+
+      const currentContent = parseAcademicPortfolioContent(entries[section.section])
+      const attachment = {
+        name: file.name,
+        path: uploadedPath,
+        type: file.type || 'application/octet-stream',
+        size: file.size,
+      }
+      const updatedContent = {
+        ...currentContent,
+        attachments: [...(currentContent.attachments || []), attachment],
+      }
+      setEntries((previous) => ({ ...previous, [section.section]: updatedContent }))
+      const saved = await saveSection(section.section, updatedContent)
+      if (!saved) {
+        setEntries((previous) => ({ ...previous, [section.section]: currentContent }))
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove([uploadedPath])
+        if (cleanupError) console.error('Could not remove the unsaved academic attachment:', cleanupError)
+        return
+      }
+    } catch (error) {
+      console.error('Upload academic portfolio attachment failed:', error)
+      if (uploadedPath) {
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove([uploadedPath])
+        if (cleanupError) console.error('Could not remove the unsaved academic attachment:', cleanupError)
+      }
+      setSaveError(error?.message || 'Could not upload this attachment.')
+    } finally {
+      setUploadingSection('')
+    }
+  }
+
+  const uploadAcademicResume = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!user?.id) {
+      setSaveError('Your account could not be identified. Please log in again.')
+      return
+    }
+
+    const extension = file.name.split('.').pop()?.toLowerCase()
+    if (!['pdf', 'doc', 'docx'].includes(extension)) {
+      setSaveError('Choose a PDF, DOC, or DOCX resume file.')
+      return
+    }
+
+    const section = ACADEMIC_PORTFOLIO_SECTIONS.find(
+      (item) => item.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_FIVE_SECTION
+    )
+    if (!section) {
+      setSaveError('The Activity 5 resume section is unavailable.')
+      return
+    }
+
+    setUploadingSection(section.section)
+    setSaveError('')
+    setSaveMessage('')
+    const currentContent = parseAcademicPortfolioContent(entries[section.section])
+    let uploadedPath = ''
+    try {
+      const safeFileName = file.name.replace(/[^\w.-]+/g, '-')
+      uploadedPath = `${user.id}/academic/activity-5-resume/${Date.now()}-${safeFileName}`
+      const contentType = file.type || ({
+        pdf: 'application/pdf',
+        doc: 'application/msword',
+        docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      })[extension]
+      const { error: uploadError } = await supabase.storage
+        .from('portfolio-files')
+        .upload(uploadedPath, file, {
+          upsert: false,
+          contentType,
+        })
+      if (uploadError) throw uploadError
+
+      const resumeFile = {
+        name: file.name,
+        path: uploadedPath,
+        type: contentType,
+        size: file.size,
+      }
+      const updatedContent = {
+        ...currentContent,
+        resume: file.name,
+        resume_file: resumeFile,
+      }
+      setEntries((previous) => ({ ...previous, [section.section]: updatedContent }))
+      const saved = await saveSection(section.section, updatedContent)
+      if (!saved) {
+        setEntries((previous) => ({ ...previous, [section.section]: currentContent }))
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove([uploadedPath])
+        if (cleanupError) {
+          console.error('Could not remove the unsaved academic resume:', cleanupError)
+        }
+        return
+      }
+
+      const previousPath = currentContent.resume_file?.path
+      if (previousPath && previousPath !== uploadedPath && previousPath.startsWith(`${user.id}/`)) {
+        try {
+          const { error: removeError } = await supabase.storage
+            .from('portfolio-files')
+            .remove([previousPath])
+          if (removeError) console.error('Could not remove the replaced academic resume:', removeError)
+        } catch (removeError) {
+          console.error('Could not remove the replaced academic resume:', removeError)
+        }
+      }
+    } catch (error) {
+      console.error('Upload academic resume failed:', error)
+      if (uploadedPath) {
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove([uploadedPath])
+        if (cleanupError) console.error('Could not remove the failed academic resume upload:', cleanupError)
+      }
+      setSaveError(error?.message || 'Could not upload your resume.')
+    } finally {
+      setUploadingSection('')
+    }
+  }
+
+  const uploadAcademicActivityDocument = async (sectionKey, fileField, activitySlug, event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!user?.id) {
+      setSaveError('Your account could not be identified. Please log in again.')
+      return
+    }
+
+    const extension = file.name.split('.').pop()?.toLowerCase()
+    const contentTypes = {
+      pdf: 'application/pdf',
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      png: 'image/png',
+    }
+    if (!contentTypes[extension]) {
+      setSaveError('Choose a PDF, JPG, JPEG, or PNG file.')
+      return
+    }
+
+    const currentContent = parseAcademicPortfolioContent(entries[sectionKey])
+    setUploadingSection(sectionKey)
+    setSaveError('')
+    setSaveMessage('')
+    let uploadedPath = ''
+    try {
+      const safeFileName = file.name.replace(/[^\w.-]+/g, '-')
+      uploadedPath = `${user.id}/academic/${activitySlug}/${Date.now()}-${safeFileName}`
+      const { error: uploadError } = await supabase.storage
+        .from('portfolio-files')
+        .upload(uploadedPath, file, {
+          upsert: false,
+          contentType: file.type || contentTypes[extension],
+        })
+      if (uploadError) throw uploadError
+
+      const document = {
+        name: file.name,
+        path: uploadedPath,
+        type: file.type || contentTypes[extension],
+        size: file.size,
+      }
+      const fileReferenceField = `${fileField}_ref`
+      const updatedContent = {
+        ...currentContent,
+        [fileField]: file.name,
+        [fileReferenceField]: document,
+      }
+      setEntries((previous) => ({ ...previous, [sectionKey]: updatedContent }))
+      const saved = await saveSection(sectionKey, updatedContent)
+      if (!saved) {
+        setEntries((previous) => ({ ...previous, [sectionKey]: currentContent }))
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove([uploadedPath])
+        if (cleanupError) console.error('Could not remove the unsaved academic document:', cleanupError)
+        return
+      }
+
+      const previousPath = currentContent[fileReferenceField]?.path
+      if (previousPath && previousPath !== uploadedPath && previousPath.startsWith(`${user.id}/`)) {
+        try {
+          const { error: removeError } = await supabase.storage
+            .from('portfolio-files')
+            .remove([previousPath])
+          if (removeError) console.error('Could not remove the replaced academic document:', removeError)
+        } catch (removeError) {
+          console.error('Could not remove the replaced academic document:', removeError)
+        }
+      }
+    } catch (error) {
+      console.error('Upload academic activity document failed:', error)
+      if (uploadedPath) {
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove([uploadedPath])
+        if (cleanupError) console.error('Could not remove the failed academic document upload:', cleanupError)
+      }
+      setSaveError(error?.message || 'Could not upload this document.')
+    } finally {
+      setUploadingSection('')
+    }
+  }
+
+  const uploadAcademicActivityFiles = async (
+    sectionKey,
+    fileField,
+    activitySlug,
+    event,
+    replaceIndex = null,
+    allowedExtensions = ['pdf', 'jpg', 'jpeg', 'png', 'webp'],
+  ) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (!files.length) return
+    if (replaceIndex !== null && files.length !== 1) {
+      setSaveError('Replace one file at a time.')
+      return
+    }
+    if (!user?.id) {
+      setSaveError('Your account could not be identified. Please log in again.')
+      return
+    }
+
+    const contentTypes = {
+      pdf: 'application/pdf',
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      png: 'image/png',
+      webp: 'image/webp',
+    }
+    if (files.some((file) => !allowedExtensions.includes(file.name.split('.').pop()?.toLowerCase()))) {
+      setSaveError('Choose JPG, JPEG, PNG, WEBP, or PDF files for this activity.')
+      return
+    }
+
+    const currentContent = parseAcademicPortfolioContent(entries[sectionKey])
+    const currentFiles = Array.isArray(currentContent[fileField]) ? currentContent[fileField] : []
+    setUploadingSection(sectionKey)
+    setSaveError('')
+    setSaveMessage('')
+    const uploadedPaths = []
+    try {
+      const newFiles = []
+      for (const [fileIndex, file] of files.entries()) {
+        const extension = file.name.split('.').pop()?.toLowerCase()
+        const safeFileName = file.name.replace(/[^\w.-]+/g, '-')
+        const uniqueId = `${Date.now()}-${fileIndex}-${Math.random().toString(36).slice(2, 8)}`
+        const path = `${user.id}/academic/${activitySlug}/${uniqueId}-${safeFileName}`
+        const { error: uploadError } = await supabase.storage
+          .from('portfolio-files')
+          .upload(path, file, {
+            upsert: false,
+            contentType: contentTypes[extension],
+          })
+        if (uploadError) throw uploadError
+        uploadedPaths.push(path)
+        newFiles.push({
+          name: file.name,
+          path,
+          type: contentTypes[extension],
+          size: file.size,
+        })
+      }
+
+      const updatedFiles = [...currentFiles]
+      if (replaceIndex === null) updatedFiles.push(...newFiles)
+      else updatedFiles.splice(replaceIndex, 1, newFiles[0])
+      const updatedContent = { ...currentContent, [fileField]: updatedFiles }
+      setEntries((previous) => ({ ...previous, [sectionKey]: updatedContent }))
+      const saved = await saveSection(sectionKey, updatedContent)
+      if (!saved) {
+        setEntries((previous) => ({ ...previous, [sectionKey]: currentContent }))
+        const { error: cleanupError } = await supabase.storage.from('portfolio-files').remove(uploadedPaths)
+        if (cleanupError) console.error('Could not remove unsaved activity evidence:', cleanupError)
+        return
+      }
+
+      const replacedPath = replaceIndex === null ? '' : currentFiles[replaceIndex]?.path
+      if (replacedPath?.startsWith(`${user.id}/`)) {
+        const { error: removeError } = await supabase.storage.from('portfolio-files').remove([replacedPath])
+        if (removeError) console.error('Could not remove replaced activity evidence:', removeError)
+      }
+    } catch (error) {
+      console.error('Upload academic activity evidence failed:', error)
+      if (uploadedPaths.length) {
+        const { error: cleanupError } = await supabase.storage.from('portfolio-files').remove(uploadedPaths)
+        if (cleanupError) console.error('Could not remove failed activity evidence:', cleanupError)
+      }
+      setSaveError(error?.message || 'Could not upload the selected files.')
+    } finally {
+      setUploadingSection('')
+    }
+  }
+
+  const removeAcademicActivityFile = async (sectionKey, fileField, fileIndex) => {
+    const currentContent = parseAcademicPortfolioContent(entries[sectionKey])
+    const currentFiles = Array.isArray(currentContent[fileField]) ? currentContent[fileField] : []
+    const fileToRemove = currentFiles[fileIndex]
+    if (!fileToRemove) return
+
+    const updatedContent = {
+      ...currentContent,
+      [fileField]: currentFiles.filter((_, index) => index !== fileIndex),
+    }
+    setEntries((previous) => ({ ...previous, [sectionKey]: updatedContent }))
+    const saved = await saveSection(sectionKey, updatedContent)
+    if (!saved) {
+      setEntries((previous) => ({ ...previous, [sectionKey]: currentContent }))
+      return
+    }
+
+    if (user?.id && fileToRemove.path?.startsWith(`${user.id}/`)) {
+      const { error: removeError } = await supabase.storage.from('portfolio-files').remove([fileToRemove.path])
+      if (removeError) {
+        console.error('Could not remove activity evidence file:', removeError)
+        setSaveError(removeError.message || 'The file reference was removed, but the stored file could not be deleted.')
+      }
+    }
+  }
+
+  const removeAcademicActivityDocument = async (sectionKey, fileField) => {
+    const currentContent = parseAcademicPortfolioContent(entries[sectionKey])
+    const referenceKey = `${fileField}_ref`
+    const document = currentContent[referenceKey]
+    if (!document) return
+
+    const updatedContent = { ...currentContent }
+    delete updatedContent[fileField]
+    delete updatedContent[referenceKey]
+    setEntries((previous) => ({ ...previous, [sectionKey]: updatedContent }))
+    const saved = await saveSection(sectionKey, updatedContent)
+    if (!saved) {
+      setEntries((previous) => ({ ...previous, [sectionKey]: currentContent }))
+      return
+    }
+
+    if (user?.id && document.path?.startsWith(`${user.id}/`)) {
+      const { error: removeError } = await supabase.storage
+        .from('portfolio-files')
+        .remove([document.path])
+      if (removeError) {
+        console.error('Could not remove activity document:', removeError)
+        setSaveError(removeError.message || 'The document reference was removed, but the stored document could not be deleted.')
+      }
+    }
+  }
+
+  const uploadCompanyProfileImages = async (event, replaceIndex = null) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (!files.length) return
+    if (!user?.id) {
+      setSaveError('Your account could not be identified. Please log in again.')
+      return
+    }
+
+    const sectionKey = 'Academic Portfolio/Immersion Proper/Activity 13 - Profile of the Company'
+    const currentContent = parseAcademicPortfolioContent(entries[sectionKey])
+    const currentImages = Array.isArray(currentContent.company_profile_images)
+      ? currentContent.company_profile_images
+      : []
+    const imageTypes = {
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      png: 'image/png',
+      webp: 'image/webp',
+    }
+    if (files.some((file) => !imageTypes[file.name.split('.').pop()?.toLowerCase()])) {
+      setSaveError('Choose JPG, JPEG, PNG, or WEBP images.')
+      return
+    }
+
+    setUploadingSection(sectionKey)
+    setSaveError('')
+    setSaveMessage('')
+    const uploadedPaths = []
+    try {
+      const newImages = []
+      for (const [fileIndex, file] of files.entries()) {
+        const extension = file.name.split('.').pop()?.toLowerCase()
+        const safeFileName = file.name.replace(/[^\w.-]+/g, '-')
+        const uniqueId = `${Date.now()}-${fileIndex}-${Math.random().toString(36).slice(2, 8)}`
+        const path = `${user.id}/academic/activity-13-company-profile/${uniqueId}-${safeFileName}`
+        const { error: uploadError } = await supabase.storage
+          .from('portfolio-files')
+          .upload(path, file, {
+            upsert: false,
+            contentType: imageTypes[extension],
+          })
+        if (uploadError) throw uploadError
+        uploadedPaths.push(path)
+        newImages.push({
+          name: file.name,
+          path,
+          type: imageTypes[extension],
+          size: file.size,
+        })
+      }
+
+      const updatedImages = [...currentImages]
+      if (replaceIndex === null) {
+        updatedImages.push(...newImages)
+      } else {
+        updatedImages.splice(replaceIndex, 1, newImages[0])
+      }
+      const updatedContent = {
+        ...currentContent,
+        company_profile_images: updatedImages,
+      }
+      setEntries((previous) => ({ ...previous, [sectionKey]: updatedContent }))
+      const saved = await saveSection(sectionKey, updatedContent)
+      if (!saved) {
+        setEntries((previous) => ({ ...previous, [sectionKey]: currentContent }))
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove(uploadedPaths)
+        if (cleanupError) console.error('Could not remove unsaved company profile images:', cleanupError)
+        return
+      }
+
+      if (replaceIndex !== null) {
+        const replacedPath = currentImages[replaceIndex]?.path
+        if (replacedPath?.startsWith(`${user.id}/`)) {
+          const { error: removeError } = await supabase.storage
+            .from('portfolio-files')
+            .remove([replacedPath])
+          if (removeError) console.error('Could not remove replaced company profile image:', removeError)
+        }
+      }
+    } catch (error) {
+      console.error('Upload company profile images failed:', error)
+      if (uploadedPaths.length) {
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove(uploadedPaths)
+        if (cleanupError) console.error('Could not remove failed company profile images:', cleanupError)
+      }
+      setSaveError(error?.message || 'Could not upload the company profile images.')
+    } finally {
+      setUploadingSection('')
+    }
+  }
+
+  const removeCompanyProfileImage = async (imageIndex) => {
+    const sectionKey = 'Academic Portfolio/Immersion Proper/Activity 13 - Profile of the Company'
+    const currentContent = parseAcademicPortfolioContent(entries[sectionKey])
+    const currentImages = Array.isArray(currentContent.company_profile_images)
+      ? currentContent.company_profile_images
+      : []
+    const imageToRemove = currentImages[imageIndex]
+    if (!imageToRemove) return
+
+    const updatedContent = {
+      ...currentContent,
+      company_profile_images: currentImages.filter((_, index) => index !== imageIndex),
+    }
+    setEntries((previous) => ({ ...previous, [sectionKey]: updatedContent }))
+    const saved = await saveSection(sectionKey, updatedContent)
+    if (!saved) {
+      setEntries((previous) => ({ ...previous, [sectionKey]: currentContent }))
+      return
+    }
+
+    if (user?.id && imageToRemove.path?.startsWith(`${user.id}/`)) {
+      const { error: removeError } = await supabase.storage
+        .from('portfolio-files')
+        .remove([imageToRemove.path])
+      if (removeError) {
+        console.error('Could not remove company profile image:', removeError)
+        setSaveError(removeError.message || 'The image reference was removed, but the stored image could not be deleted.')
+      }
+    }
+  }
+
+  const uploadStudentPhoto = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      setSaveError('Choose an image file for your student picture.')
+      return
+    }
+    if (!user?.id) {
+      setSaveError('Your account could not be identified. Please log in again.')
+      return
+    }
+
+    setStudentPhotoFile({ file, previewUrl: URL.createObjectURL(file) })
+    setUploadingSection(ACADEMIC_STUDENT_INFORMATION_SECTION)
+    setSaveError('')
+    setSaveMessage('')
+    const currentContent = parseAcademicPortfolioContent(
+      entries[ACADEMIC_STUDENT_INFORMATION_SECTION]
+    )
+    let uploadedPath = ''
+    try {
+      const safeFileName = file.name.replace(/[^\w.-]+/g, '-')
+      uploadedPath = `${user.id}/academic/student-information/${Date.now()}-${safeFileName}`
+      const { error: uploadError } = await supabase.storage
+        .from('portfolio-files')
+        .upload(uploadedPath, file, {
+          upsert: false,
+          contentType: file.type,
+        })
+      if (uploadError) throw uploadError
+
+      const updatedContent = {
+        ...currentContent,
+        student_photo: {
+          name: file.name,
+          path: uploadedPath,
+          type: file.type,
+          size: file.size,
+        },
+      }
+      setEntries((previous) => ({
+        ...previous,
+        [ACADEMIC_STUDENT_INFORMATION_SECTION]: updatedContent,
+      }))
+      const saved = await saveSection(ACADEMIC_STUDENT_INFORMATION_SECTION, updatedContent)
+      if (!saved) {
+        setEntries((previous) => ({
+          ...previous,
+          [ACADEMIC_STUDENT_INFORMATION_SECTION]: currentContent,
+        }))
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove([uploadedPath])
+        if (cleanupError) {
+          console.error('Could not remove the unsaved academic student photo:', cleanupError)
+        }
+      }
+    } catch (error) {
+      console.error('Upload academic student photo failed:', error)
+      if (uploadedPath) {
+        const { error: cleanupError } = await supabase.storage
+          .from('portfolio-files')
+          .remove([uploadedPath])
+        if (cleanupError) {
+          console.error('Could not remove the unsaved academic student photo:', cleanupError)
+        }
+      }
+      setEntries((previous) => ({
+        ...previous,
+        [ACADEMIC_STUDENT_INFORMATION_SECTION]: currentContent,
+      }))
+      setSaveError(error?.message || 'Could not upload your student picture.')
+    } finally {
+      setStudentPhotoFile(null)
+      setUploadingSection('')
+    }
+  }
+
+  const submitPortfolio = async () => {
+    if (!user?.id) {
+      setSubmissionError('Your account could not be identified. Please log in again.')
+      return
+    }
+    if (!progress.canSubmit) {
+      setSubmissionError('Complete the student portfolio activities before submitting. Assessment can be completed by your teacher and supervisor.')
+      return
+    }
+
+    setSubmitting(true)
+    setSubmissionError('')
+    setSubmissionMessage('')
+    try {
+      const snapshot = Object.fromEntries(ACADEMIC_PORTFOLIO_SECTIONS.map((section) => [
+        section.section,
+        savedEntries[section.section] || {},
+      ]))
+      const { error } = await supabase
+        .from('academic_portfolio_submissions')
+        .insert({ student_id: user.id, snapshot, status: 'submitted' })
+      if (error) throw error
+      setSubmissionMessage('Your portfolio was submitted successfully.')
+    } catch (error) {
+      console.error('Submit academic portfolio failed:', error)
+      setSubmissionError(error?.message || 'Could not submit your portfolio.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const downloadFillablePdf = async () => {
+    setDownloadingPdf(true)
+    setSaveError('')
+    try {
+      const pdfBytes = await createAcademicFillablePortfolioPdf(entries)
+      const blob = new Blob([pdfBytes], { type: 'application/pdf' })
+      await savePdfBlob(blob, 'Academic-Work-Immersion-Portfolio.pdf', null)
+    } catch (error) {
+      console.error('Generate academic fillable portfolio PDF failed:', error)
+      setSaveError(error?.message || 'Could not generate the fillable PDF.')
+    } finally {
+      setDownloadingPdf(false)
+    }
+  }
+
+  const selectedSection = ACADEMIC_PORTFOLIO_SECTIONS.find(
+    (section) => section.section === selectedSectionKey
+  )
+
+  if (selectedSection) {
+    const content = parseAcademicPortfolioContent(entries[selectedSection.section])
+    const savedContent = parseAcademicPortfolioContent(savedEntries[selectedSection.section])
+    const isStudentInformationSheet = selectedSection.section === ACADEMIC_STUDENT_INFORMATION_SECTION
+    const isPreImmersionActivityOne = selectedSection.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_ONE_SECTION
+    const isPreImmersionActivityTwo = selectedSection.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_TWO_SECTION
+    const isPreImmersionActivityThree = selectedSection.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_THREE_SECTION
+    const isPreImmersionActivityFour = selectedSection.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_FOUR_SECTION
+    const isPreImmersionActivityFive = selectedSection.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_FIVE_SECTION
+    const isPreImmersionActivitySix = selectedSection.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_SIX_SECTION
+    const isPreImmersionActivitySeven = selectedSection.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_SEVEN_SECTION
+    const isPreImmersionActivityEight = selectedSection.section === ACADEMIC_PRE_IMMERSION_ACTIVITY_EIGHT_SECTION
+    const isPreImmersionActivityNine = selectedSection.section === 'Academic Portfolio/Pre-Immersion/Activity 9 - Job Interview'
+    const isPreImmersionActivityTen = selectedSection.section === 'Academic Portfolio/Pre-Immersion/Activity 10 - Mock Job Interview'
+    const isImmersionActivityEleven = selectedSection.section === 'Academic Portfolio/Immersion Proper/Activity 11 - Attach Insurance Policy'
+    const isImmersionActivityTwelve = selectedSection.section === "Academic Portfolio/Immersion Proper/Activity 12 - Parents' Consent Form"
+    const isTheCompany = selectedSection.section === 'Academic Portfolio/Immersion Proper/The Company'
+    const isCompanyProfile = selectedSection.section === 'Academic Portfolio/Immersion Proper/Activity 13 - Profile of the Company'
+    const isActivityFifteen = selectedSection.section === 'Academic Portfolio/Immersion Proper/Activity 15 - Work Immersion Tasks'
+    const isActivitySixteen = selectedSection.section === 'Academic Portfolio/Immersion Proper/Activity 16 - Narrative Report'
+    const isActivitySeventeen = selectedSection.section === 'Academic Portfolio/Immersion Proper/Activity 17 - Civil Service Form No. 48'
+    const isActivityEighteen = selectedSection.section === 'Academic Portfolio/Post-Immersion/Activity 18 - Post-Immersion'
+    const isActivityNineteen = selectedSection.section === 'Academic Portfolio/Post-Immersion/Activity 19 - My Reflections'
+    const isAssessment = selectedSection.section === 'Academic Portfolio/Assessment/Performance Assessment Form'
+    const isReferences = selectedSection.section === 'Academic Portfolio/References/Character References'
+    const savedReferences = Array.isArray(savedContent.references) ? savedContent.references : []
+    const savedOrDraftReferences = Array.isArray(content.references)
+      ? content.references
+      : savedReferences
+    const references = savedOrDraftReferences.length ? savedOrDraftReferences : ['']
+    const hasSavedReferences = savedReferences.some((reference) => (
+      typeof reference === 'string' && reference.trim().length > 0
+    ))
+    const hasUnsavedReferences = JSON.stringify(
+      Array.isArray(content.references) ? content.references : savedReferences
+    ) !== JSON.stringify(savedReferences)
+    const hasSavedReflection = hasSavedPortfolioAnswer(savedContent.worker_reflection)
+    const hasUnsavedReflection = (content.worker_reflection || '') !== (savedContent.worker_reflection || '')
+    const hasSavedActivityTwo = selectedSection.fields.some((field) => (
+      hasSavedPortfolioAnswer(savedContent[field.key])
+    ))
+    const hasUnsavedActivityTwo = selectedSection.fields.some((field) => (
+      (content[field.key] || '') !== (savedContent[field.key] || '')
+    ))
+    const hasSavedActivityThree = hasSavedPortfolioAnswer(savedContent.situational_analysis_answer)
+    const hasUnsavedActivityThree = (content.situational_analysis_answer || '') !==
+      (savedContent.situational_analysis_answer || '')
+    const hasSavedActivityFour = hasSavedPortfolioAnswer(savedContent.conflict_resolution_answer)
+    const hasUnsavedActivityFour = (content.conflict_resolution_answer || '') !==
+      (savedContent.conflict_resolution_answer || '')
+    const hasSavedActivityFive = hasSavedPortfolioAnswer(savedContent.resume_file)
+    const hasUnsavedActivityFive = (content.resume_file?.path || '') !== (savedContent.resume_file?.path || '')
+    const hasSavedActivitySix = hasSavedPortfolioAnswer(savedContent.letter_draft)
+    const hasUnsavedActivitySix = (content.letter_draft || '') !== (savedContent.letter_draft || '')
+    const hasSavedActivitySeven = selectedSection.fields.some((field) => (
+      hasSavedPortfolioAnswer(savedContent[field.key])
+    ))
+    const hasUnsavedActivitySeven = ACADEMIC_PRE_IMMERSION_CLEARANCE_STEPS.some(({ key }) => (
+      (content[key] || '') !== (savedContent[key] || '')
+    )) || (content.clearance_file_ref?.path || '') !== (savedContent.clearance_file_ref?.path || '')
+    const hasSavedActivityEight = selectedSection.fields.some((field) => (
+      hasSavedPortfolioAnswer(savedContent[field.key])
+    ))
+    const hasUnsavedActivityEight = ACADEMIC_PRE_IMMERSION_CLEARANCE_STEPS.some(({ key }) => (
+      (content[key] || '') !== (savedContent[key] || '')
+    )) || (content.medical_certificate_file_ref?.path || '') !==
+      (savedContent.medical_certificate_file_ref?.path || '')
+    const hasSavedActivityNine = selectedSection.fields.some((field) => (
+      hasSavedPortfolioAnswer(savedContent[field.key])
+    ))
+    const hasUnsavedActivityNine = selectedSection.fields.some((field) => (
+      (content[field.key] || '') !== (savedContent[field.key] || '')
+    ))
+    const hasSavedImmersionActivityEleven = hasSavedPortfolioAnswer(savedContent.insurance_policy)
+    const hasUnsavedImmersionActivityEleven = (content.insurance_policy_ref?.path || '') !==
+      (savedContent.insurance_policy_ref?.path || '')
+    const hasSavedImmersionActivityTwelve = selectedSection.fields.some((field) => (
+      hasSavedPortfolioAnswer(savedContent[field.key])
+    ))
+    const hasUnsavedImmersionActivityTwelve = selectedSection.fields.some((field) => (
+      (content[field.key] || '') !== (savedContent[field.key] || '')
+    )) || (content.parents_permit_ref?.path || '') !== (savedContent.parents_permit_ref?.path || '')
+    const hasSavedCompanyResponses = selectedSection.fields.some((field) => (
+      hasSavedPortfolioAnswer(savedContent[field.key])
+    ))
+    const hasUnsavedCompanyResponses = selectedSection.fields.some((field) => (
+      (content[field.key] || '') !== (savedContent[field.key] || '')
+    ))
+    const hasSavedCompanyProfile = selectedSection.fields.some((field) => (
+      hasSavedPortfolioAnswer(savedContent[field.key])
+    ))
+    const hasUnsavedCompanyProfile = (
+      (content.company_profile || '') !== (savedContent.company_profile || '')
+      || (content.company_vision || '') !== (savedContent.company_vision || '')
+      || (content.company_mission || '') !== (savedContent.company_mission || '')
+      || (content.company_objectives || '') !== (savedContent.company_objectives || '')
+      || (content.company_core_values || '') !== (savedContent.company_core_values || '')
+      || JSON.stringify(getPortfolioFilePaths(content.company_profile_images))
+        !== JSON.stringify(getPortfolioFilePaths(savedContent.company_profile_images))
+    )
+    const hasSavedActivityFifteen = hasSavedPortfolioAnswer(savedContent.task_entries)
+      || hasSavedPortfolioAnswer(savedContent.task_evidence_images)
+    const hasUnsavedActivityFifteen = JSON.stringify(content.task_entries || [])
+      !== JSON.stringify(savedContent.task_entries || [])
+      || (content.tasks_and_dates || '') !== (savedContent.tasks_and_dates || '')
+      || JSON.stringify(getPortfolioFilePaths(content.task_evidence_images))
+        !== JSON.stringify(getPortfolioFilePaths(savedContent.task_evidence_images))
+    const hasSavedActivitySixteen = [
+      'introduction',
+      'activities_performed',
+      'skills_knowledge_gained',
+      'challenges_encountered',
+      'learning_experiences',
+      'conclusion',
+      'narrative_report',
+      'narrative_evidence',
+    ].some((field) => hasSavedPortfolioAnswer(savedContent[field]))
+    const hasUnsavedActivitySixteen = [
+      'introduction',
+      'activities_performed',
+      'skills_knowledge_gained',
+      'challenges_encountered',
+      'learning_experiences',
+      'conclusion',
+      'narrative_report',
+    ].some((field) => (content[field] || '') !== (savedContent[field] || ''))
+      || JSON.stringify(getPortfolioFilePaths(content.narrative_evidence))
+        !== JSON.stringify(getPortfolioFilePaths(savedContent.narrative_evidence))
+    const hasSavedActivitySeventeen = hasSavedPortfolioAnswer(savedContent.civil_service_form_ref?.path)
+    const hasUnsavedActivitySeventeen = (content.civil_service_form_ref?.path || '')
+      !== (savedContent.civil_service_form_ref?.path || '')
+    const hasSavedActivityEighteen = [
+      'memorable_experiences',
+      'key_learnings',
+      'personal_professional_development',
+      'confidence_future_readiness',
+      'work_immersion_collage',
+    ].some((field) => hasSavedPortfolioAnswer(savedContent[field]))
+    const hasUnsavedActivityEighteen = [
+      'memorable_experiences',
+      'key_learnings',
+      'personal_professional_development',
+      'confidence_future_readiness',
+    ].some((field) => (content[field] || '') !== (savedContent[field] || ''))
+      || JSON.stringify(content.work_immersion_collage || [])
+        !== JSON.stringify(savedContent.work_immersion_collage || [])
+    const hasSavedActivityNineteen = hasSavedPortfolioAnswer(savedContent.work_immersion_reflection)
+    const hasUnsavedActivityNineteen = (content.work_immersion_reflection || '')
+      !== (savedContent.work_immersion_reflection || '')
+    const hasUnsavedAssessment = JSON.stringify(content.assessment_ratings || {})
+      !== JSON.stringify(savedContent.assessment_ratings || {})
+      || JSON.stringify(content.assessment_feedback || {})
+        !== JSON.stringify(savedContent.assessment_feedback || {})
+      || JSON.stringify(getPortfolioFilePaths(content.attachments))
+        !== JSON.stringify(getPortfolioFilePaths(savedContent.attachments))
+    const isStaticSection = isReferences
+    const sectionComplete = isAcademicPortfolioSectionComplete(selectedSection, savedContent)
+    const completedFields = selectedSection.fields.filter((field) => (
+      hasSavedPortfolioAnswer(savedContent[field.key])
+    )).length
+    const attachments = Array.isArray(content.attachments) ? content.attachments : []
+    const renderField = (field, disabled = false) => (
+      <label
+        className={`academic-portfolio-field ${isPreImmersionActivityOne ? 'academic-reflection-field' : ''}`}
+        key={field.key}
+      >
+        <span>{field.label}</span>
+        {field.type ? (
+          <input
+            type={field.type}
+            value={isStudentInformationSheet
+              ? getAcademicStudentInformationFieldValue(content, field.key)
+              : content[field.key] || ''}
+            onChange={(event) => updateField(selectedSection.section, field.key, event.target.value)}
+            disabled={loading || disabled}
+            maxLength={500}
+          />
+        ) : (
+          <textarea
+            className={isPreImmersionActivityOne ? 'academic-reflection-textarea' : ''}
+            value={content[field.key] || ''}
+            onChange={(event) => updateField(selectedSection.section, field.key, event.target.value)}
+            rows={field.rows || 5}
+            maxLength={10000}
+            disabled={loading || disabled}
+          />
+        )}
+      </label>
+    )
+
+    return (
+      <div className="dashboard-section academic-portfolio">
+        <button
+          type="button"
+          className="academic-portfolio-back"
+          onClick={() => {
+            setSelectedSectionKey('')
+            setEditingSectionKey('')
+            setSaveError('')
+            setSaveMessage('')
+          }}
+        >
+          <ArrowLeft size={17} />
+          Back to Academic Portfolio
+        </button>
+        <p className="eyebrow">STUDENT DASHBOARD / MY PORTFOLIO / {selectedSection.group}</p>
+        <div className={`academic-portfolio-detail-header ${isPreImmersionActivityFive ? 'academic-activity-five-header' : ''}`}>
+          <div>
+            <h1>{selectedSection.title}</h1>
+            {!isPreImmersionActivityFive
+              && !isPreImmersionActivitySix
+              && !isPreImmersionActivityNine
+              && !isPreImmersionActivityTen
+              && !isTheCompany
+              && !isCompanyProfile
+              && selectedSection.description
+              && (
+              <p>{selectedSection.description}</p>
+            )}
+          </div>
+          {!isStaticSection && (
+            <span className={`academic-portfolio-completion ${sectionComplete ? 'complete' : ''}`}>
+              {sectionComplete ? 'Complete' : `${completedFields}/${selectedSection.fields.length} fields`}
+            </span>
+          )}
+        </div>
+        {loading && <p role="status">Loading your saved work...</p>}
+        {errorMessage && <p role="alert" className="academic-portfolio-error">{errorMessage}</p>}
+        {saveError && <p role="alert" className="academic-portfolio-error">{saveError}</p>}
+        {saveMessage && !isPreImmersionActivityOne && !isPreImmersionActivityTwo && !isPreImmersionActivityThree && !isPreImmersionActivityFour && !isPreImmersionActivityFive && !isPreImmersionActivitySix && !isPreImmersionActivitySeven && !isPreImmersionActivityEight && !isPreImmersionActivityNine && !isImmersionActivityEleven && !isImmersionActivityTwelve && !isTheCompany && !isCompanyProfile && !isActivityFifteen && !isActivitySixteen && !isActivitySeventeen && !isActivityEighteen && !isActivityNineteen && !isAssessment && !isReferences && <p role="status" className="academic-portfolio-success">{saveMessage}</p>}
+
+        <section className="academic-portfolio-editor">
+          {isAssessment ? (
+            <div className="academic-assessment-content">
+              <h2>PERFORMANCE ASSESSMENT FORM</h2>
+              <p>The Work Immersion Teacher and the Work Immersion Partner Institution Supervisor will jointly assess the learners’ performance following the DepEd Order No. 8, s. 2015 (Policy Guidelines on Classroom Assessment for the K TO 12 Basic Education Program). The Work Immersion Teacher shall then issue the Final Grade (from DepEd Order No. 30, S. 2017, Section 8. Page 11 of 11).</p>
+              <p>Assessment ratings and feedback are recorded separately from the activity pages. The original rubric activity numbers are preserved.</p>
+              {ACADEMIC_ASSESSMENT_FORMS.map((form) => (
+                <AcademicAssessmentTable
+                  form={form}
+                  key={form.key}
+                  ratings={content.assessment_ratings?.[form.key] || {}}
+                  feedback={content.assessment_feedback || {}}
+                  disabled={loading || savingSection === selectedSection.section}
+                  onRatingChange={(rowIndex, rating) => {
+                    const formRatings = content.assessment_ratings?.[form.key] || {}
+                    updateField(selectedSection.section, 'assessment_ratings', {
+                      ...(content.assessment_ratings || {}),
+                      [form.key]: { ...formRatings, [rowIndex]: rating },
+                    })
+                  }}
+                  onFeedbackChange={(feedbackKey, value) => updateField(
+                    selectedSection.section,
+                    'assessment_feedback',
+                    {
+                      ...(content.assessment_feedback || {}),
+                      [feedbackKey]: value,
+                    },
+                  )}
+                />
+              ))}
+              <section className="academic-work-evidence">
+                <h2>Assessment documents and signatures</h2>
+                <p>Attach signed assessment pages or other required assessment documents when provided.</p>
+                <label className="academic-portfolio-upload">
+                  <span>{uploadingSection === selectedSection.section ? 'Uploading...' : 'Add assessment document'}</span>
+                  <input
+                    type="file"
+                    accept=".pdf,.jpg,.jpeg,.png,.webp,application/pdf,image/jpeg,image/png,image/webp"
+                    onChange={(event) => uploadAttachment(selectedSection, event)}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                  />
+                </label>
+                <AcademicPortfolioEvidenceGallery
+                  files={attachments}
+                  accept=".pdf,.jpg,.jpeg,.png,.webp,application/pdf,image/jpeg,image/png,image/webp"
+                  disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+                  onReplace={(index, event) => uploadAcademicActivityFiles(
+                    selectedSection.section,
+                    'attachments',
+                    'assessment-documents',
+                    event,
+                    index,
+                  )}
+                  onRemove={(index) => removeAcademicActivityFile(
+                    selectedSection.section,
+                    'attachments',
+                    index,
+                  )}
+                />
+              </section>
+              <p role="status" className={`academic-immersion-status ${hasUnsavedAssessment ? 'unsaved' : sectionComplete ? 'saved' : ''}`}>
+                {loading
+                  ? 'Loading your saved assessment...'
+                  : uploadingSection === selectedSection.section
+                    ? 'Uploading assessment document...'
+                    : savingSection === selectedSection.section
+                      ? 'Saving assessment...'
+                      : hasUnsavedAssessment
+                        ? 'Unsaved assessment changes'
+                        : sectionComplete
+                          ? saveMessage || 'Assessment saved'
+                          : 'Assessment not complete'}
+              </p>
+            </div>
+          ) : isReferences ? (
+            <div className="academic-references-content">
+              <p>Add the sources you used for your portfolio.</p>
+              <div className="academic-reference-list">
+                {references.map((reference, index) => (
+                  <div className="academic-reference-entry" key={`reference-${index}`}>
+                    <label className="academic-portfolio-field">
+                      <span>Reference {index + 1}</span>
+                      <textarea
+                        value={reference}
+                        onChange={(event) => updateField(
+                          selectedSection.section,
+                          'references',
+                          references.map((item, referenceIndex) => (
+                            referenceIndex === index ? event.target.value : item
+                          )),
+                        )}
+                        rows={3}
+                        maxLength={2000}
+                        disabled={loading || (
+                          hasSavedReferences && editingSectionKey !== selectedSection.section
+                        )}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="secondary-btn academic-reference-remove"
+                      onClick={() => updateField(
+                        selectedSection.section,
+                        'references',
+                        references.filter((_, referenceIndex) => referenceIndex !== index),
+                      )}
+                      disabled={loading || savingSection === selectedSection.section || (
+                        hasSavedReferences && editingSectionKey !== selectedSection.section
+                      )}
+                      aria-label={`Remove reference ${index + 1}`}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="secondary-btn academic-reference-add"
+                onClick={() => updateField(
+                  selectedSection.section,
+                  'references',
+                  [...references, ''],
+                )}
+                disabled={loading || savingSection === selectedSection.section || (
+                  hasSavedReferences && editingSectionKey !== selectedSection.section
+                )}
+              >
+                Add Reference
+              </button>
+              <p
+                role="status"
+                className={`academic-immersion-status ${
+                  hasUnsavedReferences ? 'unsaved' : hasSavedReferences ? 'saved' : ''
+                }`}
+              >
+                {loading
+                  ? 'Loading your saved references...'
+                  : savingSection === selectedSection.section
+                    ? 'Saving references...'
+                    : hasUnsavedReferences
+                      ? 'Unsaved changes'
+                      : hasSavedReferences
+                        ? saveMessage || 'References saved'
+                        : saveMessage || 'No references saved yet'}
+              </p>
+            </div>
+          ) : isActivityFifteen ? (
+            <div className="academic-work-activity-content">
+              {content.tasks_and_dates && (
+                <label className="academic-portfolio-field">
+                  <span>Previously saved task notes</span>
+                  <textarea
+                    value={content.tasks_and_dates}
+                    onChange={(event) => updateField(
+                      selectedSection.section,
+                      'tasks_and_dates',
+                      event.target.value,
+                    )}
+                    rows={5}
+                    disabled={loading}
+                  />
+                </label>
+              )}
+              {(Array.isArray(content.task_entries) ? content.task_entries : []).map((task, index) => {
+                const updateTask = (field, value) => {
+                  const tasks = [...content.task_entries]
+                  tasks[index] = { ...task, [field]: value }
+                  updateField(selectedSection.section, 'task_entries', tasks)
+                }
+                return (
+                  <section className="academic-work-evidence" key={`task-${index}`}>
+                    <h2>Task {index + 1}</h2>
+                    <label className="academic-portfolio-field">
+                      <span>Date</span>
+                      <input
+                        type="date"
+                        value={task.date || ''}
+                        onChange={(event) => updateTask('date', event.target.value)}
+                        disabled={loading}
+                      />
+                    </label>
+                    <label className="academic-portfolio-field">
+                      <span>Task or activity performed</span>
+                      <textarea
+                        value={task.task || ''}
+                        onChange={(event) => updateTask('task', event.target.value)}
+                        rows={3}
+                        disabled={loading}
+                      />
+                    </label>
+                    <label className="academic-portfolio-field">
+                      <span>Description of work assigned</span>
+                      <textarea
+                        value={task.description || ''}
+                        onChange={(event) => updateTask('description', event.target.value)}
+                        rows={4}
+                        disabled={loading}
+                      />
+                    </label>
+                    <label className="academic-portfolio-field">
+                      <span>Skills and knowledge applied</span>
+                      <textarea
+                        value={task.skills_knowledge || ''}
+                        onChange={(event) => updateTask('skills_knowledge', event.target.value)}
+                        rows={4}
+                        disabled={loading}
+                      />
+                    </label>
+                    <label className="academic-portfolio-field">
+                      <span>Learning gained</span>
+                      <textarea
+                        value={task.learning_gained || ''}
+                        onChange={(event) => updateTask('learning_gained', event.target.value)}
+                        rows={4}
+                        disabled={loading}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={() => updateField(
+                        selectedSection.section,
+                        'task_entries',
+                        content.task_entries.filter((_, taskIndex) => taskIndex !== index),
+                      )}
+                      disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+                    >
+                      Remove task
+                    </button>
+                  </section>
+                )
+              })}
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => updateField(
+                  selectedSection.section,
+                  'task_entries',
+                  [...(Array.isArray(content.task_entries) ? content.task_entries : []), {}],
+                )}
+                disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+              >
+                Add another task
+              </button>
+              <section className="academic-work-evidence">
+                <h2>Supporting photos or evidence</h2>
+                <label className="academic-portfolio-upload">
+                  <span>{uploadingSection === selectedSection.section ? 'Uploading images...' : 'Add Photos'}</span>
+                  <input
+                    type="file"
+                    accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                    multiple
+                    onChange={(event) => uploadAcademicActivityFiles(
+                      selectedSection.section,
+                      'task_evidence_images',
+                      'activity-15-work-immersion-tasks',
+                      event,
+                      null,
+                      ['jpg', 'jpeg', 'png', 'webp'],
+                    )}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                    aria-label="Upload photos supporting work immersion tasks"
+                  />
+                </label>
+                <AcademicPortfolioEvidenceGallery
+                  files={Array.isArray(content.task_evidence_images) ? content.task_evidence_images : []}
+                  accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                  disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+                  onReplace={(index, event) => uploadAcademicActivityFiles(
+                    selectedSection.section,
+                    'task_evidence_images',
+                    'activity-15-work-immersion-tasks',
+                    event,
+                    index,
+                    ['jpg', 'jpeg', 'png', 'webp'],
+                  )}
+                  onRemove={(index) => removeAcademicActivityFile(
+                    selectedSection.section,
+                    'task_evidence_images',
+                    index,
+                  )}
+                />
+              </section>
+              <p role="status" className={`academic-immersion-status ${hasUnsavedActivityFifteen ? 'unsaved' : hasSavedActivityFifteen ? 'saved' : ''}`}>
+                {loading ? 'Loading your saved work...' : uploadingSection === selectedSection.section ? 'Uploading and saving photos...' : savingSection === selectedSection.section ? 'Saving your work...' : hasUnsavedActivityFifteen ? 'Unsaved changes' : hasSavedActivityFifteen ? saveMessage || 'Activity 15 saved' : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isActivitySixteen ? (
+            <div className="academic-work-activity-content">
+              <p>A daily task record is a work log that summarizes how an employee spent his time on the job. Through a daily work log, an employee can create a mental picture of what comprises his day and how he uses his time. It is also helpful in understanding how productive an employee is during a particular period of the workday.</p>
+              <p>Attach photos, illustrations, and other evidences (e.g. certificates of awards received) of performed hands-on skills that include knowledge of work and quality of work done.</p>
+              {content.narrative_report && (
+                <details>
+                  <summary>Previously saved narrative report</summary>
+                  <p>{content.narrative_report}</p>
+                </details>
+              )}
+              {selectedSection.fields.slice(0, 6).map((field) => renderField(
+                field,
+                hasSavedActivitySixteen && editingSectionKey !== selectedSection.section,
+              ))}
+              <section className="academic-work-evidence">
+                <h2>Photos, illustrations, and other evidence</h2>
+                <label className="academic-portfolio-upload">
+                  <span>{uploadingSection === selectedSection.section ? 'Uploading files...' : 'Add Evidence'}</span>
+                  <input
+                    type="file"
+                    accept=".jpg,.jpeg,.png,.webp,.pdf,image/jpeg,image/png,image/webp,application/pdf"
+                    multiple
+                    onChange={(event) => uploadAcademicActivityFiles(
+                      selectedSection.section,
+                      'narrative_evidence',
+                      'activity-16-narrative-report',
+                      event,
+                    )}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                    aria-label="Upload photos and documents for the narrative report"
+                  />
+                </label>
+                <AcademicPortfolioEvidenceGallery
+                  files={Array.isArray(content.narrative_evidence) ? content.narrative_evidence : []}
+                  accept=".jpg,.jpeg,.png,.webp,.pdf,image/jpeg,image/png,image/webp,application/pdf"
+                  disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+                  onReplace={(index, event) => uploadAcademicActivityFiles(
+                    selectedSection.section,
+                    'narrative_evidence',
+                    'activity-16-narrative-report',
+                    event,
+                    index,
+                  )}
+                  onRemove={(index) => removeAcademicActivityFile(
+                    selectedSection.section,
+                    'narrative_evidence',
+                    index,
+                  )}
+                />
+              </section>
+              <p role="status" className={`academic-immersion-status ${hasUnsavedActivitySixteen ? 'unsaved' : hasSavedActivitySixteen ? 'saved' : ''}`}>
+                {loading ? 'Loading your saved report...' : uploadingSection === selectedSection.section ? 'Uploading and saving evidence...' : savingSection === selectedSection.section ? 'Saving your narrative report...' : hasUnsavedActivitySixteen ? 'Unsaved changes' : hasSavedActivitySixteen ? saveMessage || 'Narrative report saved' : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isActivitySeventeen ? (
+            <div className="academic-work-activity-content">
+              <section className="academic-immersion-upload">
+                <h2>CIVIL SERVICE FORM NO. 48 — DAILY TIME RECORD</h2>
+                <label className="academic-portfolio-upload">
+                  <span>
+                    {uploadingSection === selectedSection.section
+                      ? 'Uploading form...'
+                      : content.civil_service_form_ref
+                        ? 'Replace File'
+                        : 'Choose File'}
+                  </span>
+                  <input
+                    type="file"
+                    accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+                    onChange={(event) => uploadAcademicActivityDocument(
+                      selectedSection.section,
+                      'civil_service_form',
+                      'activity-17-civil-service-form-48',
+                      event,
+                    )}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                    aria-label="Upload Civil Service Form No. 48"
+                  />
+                </label>
+                {content.civil_service_form_ref && (
+                  <div className="academic-immersion-file">
+                    <AcademicPortfolioFileLink attachment={content.civil_service_form_ref} previewImage />
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={() => removeAcademicActivityDocument(selectedSection.section, 'civil_service_form')}
+                      disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+                    >
+                      Remove file
+                    </button>
+                  </div>
+                )}
+              </section>
+              <p role="status" className={`academic-immersion-status ${hasUnsavedActivitySeventeen ? 'unsaved' : hasSavedActivitySeventeen ? 'saved' : ''}`}>
+                {loading ? 'Loading your saved form...' : uploadingSection === selectedSection.section ? 'Uploading and saving your form...' : savingSection === selectedSection.section ? 'Saving your form...' : hasUnsavedActivitySeventeen ? 'Unsaved changes' : hasSavedActivitySeventeen ? saveMessage || 'Form saved' : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isActivityEighteen ? (
+            <div className="academic-work-activity-content">
+              <p>Dear students you are now on the final stretch of your work immersion course. At this juncture you need to revisit the things that have been done in the past few days. What are the events that are memorable to you, what are the key learning’s that you have achieved and lastly you need to evaluate if the experienced gave you more confidence to face what lies ahead.</p>
+              {selectedSection.fields.slice(0, 4).map(renderField)}
+              <h2>Work Immersion Photo Collage</h2>
+              <section className="academic-work-evidence">
+                <label className="academic-portfolio-upload">
+                  <span>{uploadingSection === selectedSection.section ? 'Uploading pictures...' : 'Add Pictures'}</span>
+                  <input
+                    type="file"
+                    accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                    multiple
+                    onChange={(event) => uploadAcademicActivityFiles(
+                      selectedSection.section,
+                      'work_immersion_collage',
+                      'activity-18-work-immersion-collage',
+                      event,
+                      null,
+                      ['jpg', 'jpeg', 'png', 'webp'],
+                    )}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                    aria-label="Upload work immersion collage pictures"
+                  />
+                </label>
+                <AcademicPortfolioEvidenceGallery
+                  files={Array.isArray(content.work_immersion_collage) ? content.work_immersion_collage : []}
+                  accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                  disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+                  onReplace={(index, event) => uploadAcademicActivityFiles(
+                    selectedSection.section,
+                    'work_immersion_collage',
+                    'activity-18-work-immersion-collage',
+                    event,
+                    index,
+                    ['jpg', 'jpeg', 'png', 'webp'],
+                  )}
+                  onRemove={(index) => removeAcademicActivityFile(
+                    selectedSection.section,
+                    'work_immersion_collage',
+                    index,
+                  )}
+                />
+                {(Array.isArray(content.work_immersion_collage) ? content.work_immersion_collage : []).map((photo, index) => (
+                  <div className="academic-assessment-feedback" key={photo.path}>
+                    <label className="academic-portfolio-field">
+                      <span>Photo {index + 1} caption</span>
+                      <input
+                        type="text"
+                        value={photo.caption || ''}
+                        onChange={(event) => updateField(
+                          selectedSection.section,
+                          'work_immersion_collage',
+                          content.work_immersion_collage.map((item, photoIndex) => (
+                            photoIndex === index
+                              ? { ...item, caption: event.target.value }
+                              : item
+                          )),
+                        )}
+                        disabled={loading}
+                      />
+                    </label>
+                    <label className="academic-portfolio-field">
+                      <span>Photo {index + 1} date</span>
+                      <input
+                        type="date"
+                        value={photo.date || ''}
+                        onChange={(event) => updateField(
+                          selectedSection.section,
+                          'work_immersion_collage',
+                          content.work_immersion_collage.map((item, photoIndex) => (
+                            photoIndex === index
+                              ? { ...item, date: event.target.value }
+                              : item
+                          )),
+                        )}
+                        disabled={loading}
+                      />
+                    </label>
+                  </div>
+                ))}
+              </section>
+              <p role="status" className={`academic-immersion-status ${hasUnsavedActivityEighteen ? 'unsaved' : hasSavedActivityEighteen ? 'saved' : ''}`}>
+                {loading ? 'Loading your saved collage...' : uploadingSection === selectedSection.section ? 'Uploading and saving pictures...' : savingSection === selectedSection.section ? 'Saving your collage...' : hasUnsavedActivityEighteen ? 'Unsaved changes' : hasSavedActivityEighteen ? saveMessage || 'Collage saved' : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isActivityNineteen ? (
+            <div className="academic-work-activity-content">
+              {renderField(
+                selectedSection.fields[0],
+                hasSavedActivityNineteen && editingSectionKey !== selectedSection.section,
+              )}
+              <p role="status" className={`academic-immersion-status ${hasUnsavedActivityNineteen ? 'unsaved' : hasSavedActivityNineteen ? 'saved' : ''}`}>
+                {loading ? 'Loading your saved reflection...' : savingSection === selectedSection.section ? 'Saving your reflection...' : hasUnsavedActivityNineteen ? 'Unsaved changes' : hasSavedActivityNineteen ? saveMessage || 'Reflection saved' : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isCompanyProfile ? (
+            <div className="academic-company-profile-content">
+              <section className="academic-company-profile-sample">
+                <h2>Sample Company Profile</h2>
+                <p>Owner Johanna Shandy served as a pioneer of cultural gentrification when she opened the café nearly a decade ago. Her father established the family’s business in Palao Market about 30 years ago. Johanna runs the café with her 2 sons. The café has 10 employees and seats 50 in its 60 meter location. Menu offers freshly baked pastries and desserts, homemade pastas, breakfast, salads and various gourmet main courses like the famed Bouillabaisse dish.</p>
+              </section>
+
+              <section className="academic-company-profile-student">
+                <h2>II. Student’s Company Profile</h2>
+                <p>Write description and profile of your work immersion area. Please include pictures.</p>
+                {renderField(selectedSection.fields[0])}
+                <div className="academic-company-profile-images">
+                  <h3>Pictures of your work immersion area</h3>
+                  <label className="academic-portfolio-upload">
+                    <span>{uploadingSection === selectedSection.section ? 'Uploading images...' : 'Add Pictures'}</span>
+                    <input
+                      type="file"
+                      accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                      multiple
+                      onChange={(event) => uploadCompanyProfileImages(event)}
+                      disabled={loading || uploadingSection === selectedSection.section}
+                      aria-label="Add pictures of your work immersion area"
+                    />
+                  </label>
+                  {Array.isArray(content.company_profile_images) && content.company_profile_images.length > 0 ? (
+                    <div className="academic-company-profile-gallery">
+                      {content.company_profile_images.map((image, index) => (
+                        <article className="academic-company-profile-image" key={image.path}>
+                          <AcademicPortfolioFileLink attachment={image} previewImage />
+                          <div className="academic-company-profile-image-actions">
+                            <label className="academic-portfolio-upload">
+                              <span>Replace picture</span>
+                              <input
+                                type="file"
+                                accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                                onChange={(event) => uploadCompanyProfileImages(event, index)}
+                                disabled={loading || uploadingSection === selectedSection.section}
+                                aria-label={`Replace picture ${index + 1}`}
+                              />
+                            </label>
+                            <button
+                              type="button"
+                              className="secondary-btn"
+                              onClick={() => removeCompanyProfileImage(index)}
+                              disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="academic-company-profile-empty">No pictures added yet.</p>
+                  )}
+                </div>
+              </section>
+
+              <section className="academic-company-profile-pillars">
+                <h2>III. Vision, Mission, Objectives, and Core Values</h2>
+                {selectedSection.fields.slice(2).map(renderField)}
+              </section>
+              <p
+                role="status"
+                className={`academic-immersion-status ${hasUnsavedCompanyProfile ? 'unsaved' : hasSavedCompanyProfile ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved company profile...'
+                  : uploadingSection === selectedSection.section
+                    ? 'Uploading and saving pictures...'
+                    : savingSection === selectedSection.section
+                      ? 'Saving your company profile...'
+                      : hasUnsavedCompanyProfile
+                        ? 'Unsaved changes'
+                        : hasSavedCompanyProfile
+                          ? saveMessage || 'Company profile saved'
+                          : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isImmersionActivityEleven ? (
+            <div className="academic-immersion-activity-content">
+              <section className="academic-immersion-upload">
+                <h2>INSURANCE POLICY</h2>
+                <label className="academic-portfolio-upload">
+                  <span>
+                    {uploadingSection === selectedSection.section
+                      ? 'Uploading document...'
+                      : content.insurance_policy_ref
+                        ? 'Replace File'
+                        : 'Choose File'}
+                  </span>
+                  <input
+                    type="file"
+                    accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf"
+                    onChange={(event) => uploadAcademicActivityDocument(
+                      selectedSection.section,
+                      'insurance_policy',
+                      'activity-11-insurance-policy',
+                      event,
+                    )}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                    aria-label="Upload or replace insurance policy"
+                  />
+                </label>
+                {content.insurance_policy_ref && (
+                  <div className="academic-immersion-file">
+                    <strong>{content.insurance_policy_ref.name}</strong>
+                    <AcademicPortfolioFileLink
+                      attachment={content.insurance_policy_ref}
+                      previewImage
+                    />
+                  </div>
+                )}
+              </section>
+              <p
+                role="status"
+                className={`academic-immersion-status ${hasUnsavedImmersionActivityEleven ? 'unsaved' : hasSavedImmersionActivityEleven ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved insurance policy...'
+                  : uploadingSection === selectedSection.section
+                    ? 'Uploading and saving your insurance policy...'
+                    : savingSection === selectedSection.section
+                      ? 'Saving your insurance policy...'
+                      : hasUnsavedImmersionActivityEleven
+                        ? 'Unsaved changes'
+                        : hasSavedImmersionActivityEleven
+                          ? saveMessage || 'Insurance policy saved'
+                          : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isImmersionActivityTwelve ? (
+            <div className="academic-immersion-activity-content">
+              <section className="academic-immersion-upload">
+                <h2>I. Attach Parents Permit here</h2>
+                <label className="academic-portfolio-upload">
+                  <span>
+                    {uploadingSection === selectedSection.section
+                      ? 'Uploading document...'
+                      : content.parents_permit_ref
+                        ? 'Replace File'
+                        : 'Choose File'}
+                  </span>
+                  <input
+                    type="file"
+                    accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+                    onChange={(event) => uploadAcademicActivityDocument(
+                      selectedSection.section,
+                      'parents_permit',
+                      'activity-12-parents-permit',
+                      event,
+                    )}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                    aria-label="Upload or replace signed Parents Permit"
+                  />
+                </label>
+                {content.parents_permit_ref && (
+                  <div className="academic-immersion-file">
+                    <strong>{content.parents_permit_ref.name}</strong>
+                    <AcademicPortfolioFileLink
+                      attachment={content.parents_permit_ref}
+                      previewImage
+                    />
+                  </div>
+                )}
+              </section>
+
+              <section className="academic-consent-form">
+                <h2>II. CONSENT FORM</h2>
+                <h3>WORK IMMERSION</h3>
+                <h3>Student Information</h3>
+                {selectedSection.fields.slice(1, 4).map(renderField)}
+                <h3>Parent/Guardian Information</h3>
+                {selectedSection.fields.slice(4, 7).map(renderField)}
+                <h3>MEDICAL BACKGROUND</h3>
+                <fieldset className="academic-consent-choice">
+                  <legend>
+                    Does your child suffer from any medical conditions/allergies? (please check appropriate box)
+                  </legend>
+                  {['Yes', 'No'].map((answer) => (
+                    <label key={answer}>
+                      <input
+                        type="radio"
+                        name={`consent-medical-${user?.id || 'student'}`}
+                        value={answer}
+                        checked={content.consent_medical_conditions === answer}
+                        onChange={() => updateField(
+                          selectedSection.section,
+                          'consent_medical_conditions',
+                          answer,
+                        )}
+                        disabled={loading}
+                      />
+                      {answer}
+                    </label>
+                  ))}
+                </fieldset>
+                {renderField(selectedSection.fields[8])}
+                <h3>UNDERTAKING:</h3>
+                <div className="academic-consent-undertaking">
+                  <p>a) I agree to my son/daughter taking part in the Work Immersion as a key feature of the Senior High School Curriculum, which involves hands-on experience or work simulation in which learners can apply their competencies and acquired knowledge relevant to their track;</p>
+                  <p>b) I understand that an insurance for learners in DepEd schools shall be procured by their respective schools, hence, I hereby release the school, its teachers and personnel from any and all liability, claims, demands, and causes of action whatsoever arising out of or related to any loss, damage or injury that may be sustained by my son/daughter during the Work Immersion;</p>
+                  <p>c) I confirm to the best of my knowledge that my son/daughter does not suffer from any medical condition other than those listed above;</p>
+                  <p>d) That I have read and fully understood the statements above including the implications thereof.</p>
+                </div>
+                <h3>Parent/Guardian Confirmation</h3>
+                {renderField(selectedSection.fields[9])}
+                {renderField(selectedSection.fields[10])}
+              </section>
+              <p
+                role="status"
+                className={`academic-immersion-status ${hasUnsavedImmersionActivityTwelve ? 'unsaved' : hasSavedImmersionActivityTwelve ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved consent form...'
+                  : uploadingSection === selectedSection.section
+                    ? 'Uploading and saving your Parents Permit...'
+                    : savingSection === selectedSection.section
+                      ? 'Saving your consent form...'
+                      : hasUnsavedImmersionActivityTwelve
+                        ? 'Unsaved changes'
+                        : hasSavedImmersionActivityTwelve
+                          ? saveMessage || 'Consent form saved'
+                          : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isTheCompany ? (
+            <div className="academic-immersion-activity-content">
+              <h2>Objectives:</h2>
+              <p>{selectedSection.description}</p>
+              <div className="academic-company-responses">
+                {selectedSection.fields.map(renderField)}
+              </div>
+              <p
+                role="status"
+                className={`academic-immersion-status ${hasUnsavedCompanyResponses ? 'unsaved' : hasSavedCompanyResponses ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved responses...'
+                  : savingSection === selectedSection.section
+                    ? 'Saving your responses...'
+                    : hasUnsavedCompanyResponses
+                      ? 'Unsaved changes'
+                      : hasSavedCompanyResponses
+                        ? saveMessage || 'Responses saved'
+                        : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isPreImmersionActivityNine ? (
+            <div className="academic-activity-nine-content">
+              <p className="academic-activity-nine-introduction">{selectedSection.description}</p>
+              <h2>I. Questions Encountered During the First Dialogue</h2>
+              <label className="academic-portfolio-field academic-activity-nine-dialogue">
+                <span>Questions encountered during the first dialogue</span>
+                <textarea
+                  value={content.interview_question || ''}
+                  onChange={(event) => updateField(
+                    selectedSection.section,
+                    'interview_question',
+                    event.target.value,
+                  )}
+                  rows={10}
+                  maxLength={10000}
+                  disabled={loading}
+                />
+              </label>
+              <h2>II. MOCK JOB INTERVIEW</h2>
+              <p>Here are some questions that you may encounter during an interview. Try answering them.</p>
+              {ACADEMIC_ACTIVITY_NINE_QUESTION_GROUPS.map((group) => (
+                <section className="academic-activity-nine-category" key={group.key}>
+                  <h3>{group.title}</h3>
+                  {group.instruction && <p>{group.instruction}</p>}
+                  {group.questions.map((question, index) => {
+                    const answerKey = `mock_${group.key}_${index + 1}`
+                    return (
+                      <label className="academic-portfolio-field academic-activity-nine-question" key={answerKey}>
+                        <strong>{index + 1}. {question}</strong>
+                        <textarea
+                          aria-label={`Answer: ${question}`}
+                          value={content[answerKey] || ''}
+                          onChange={(event) => updateField(
+                            selectedSection.section,
+                            answerKey,
+                            event.target.value,
+                          )}
+                          rows={5}
+                          maxLength={10000}
+                          disabled={loading}
+                        />
+                      </label>
+                    )
+                  })}
+                </section>
+              ))}
+              <p
+                role="status"
+                className={`academic-activity-nine-status ${hasUnsavedActivityNine ? 'unsaved' : hasSavedActivityNine ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved answers...'
+                  : savingSection === selectedSection.section
+                    ? 'Saving your answers...'
+                    : hasUnsavedActivityNine
+                      ? 'Unsaved changes'
+                      : hasSavedActivityNine
+                        ? saveMessage || 'Saved'
+                        : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isPreImmersionActivitySix ? (
+            <div className="academic-activity-six-content">
+              <h2>APPLICATION LETTER</h2>
+              <label className="academic-portfolio-field academic-activity-six-letter">
+                <span>Write and compose your own application letter.</span>
+                <textarea
+                  value={content.letter_draft || ''}
+                  onChange={(event) => updateField(
+                    selectedSection.section,
+                    'letter_draft',
+                    event.target.value,
+                  )}
+                  rows={18}
+                  maxLength={10000}
+                  disabled={loading}
+                />
+              </label>
+              <p
+                role="status"
+                className={`academic-activity-six-status ${hasUnsavedActivitySix ? 'unsaved' : hasSavedActivitySix ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved application letter...'
+                  : savingSection === selectedSection.section
+                    ? 'Saving your application letter...'
+                    : hasUnsavedActivitySix
+                      ? 'Unsaved changes'
+                      : hasSavedActivitySix
+                        ? saveMessage || 'Application letter saved'
+                        : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isPreImmersionActivitySeven || isPreImmersionActivityEight ? (
+            <div className={`academic-activity-clearance-content ${isPreImmersionActivityEight ? 'medical-certificate-activity' : ''}`}>
+              <h2>I. Steps in securing {isPreImmersionActivitySeven ? 'Barangay Clearance' : 'Medical Certificate'}</h2>
+              <div className="academic-clearance-steps">
+                {ACADEMIC_PRE_IMMERSION_CLEARANCE_STEPS.map(({ number, key }) => (
+                  <label className="academic-portfolio-field" key={key}>
+                    <span>{number}.</span>
+                    <textarea
+                      aria-label={`Step ${number}`}
+                      value={content[key] || ''}
+                      onChange={(event) => updateField(selectedSection.section, key, event.target.value)}
+                      rows={3}
+                      maxLength={10000}
+                      disabled={loading}
+                    />
+                  </label>
+                ))}
+              </div>
+              <section className="academic-clearance-upload">
+                <h2>II. Attach {isPreImmersionActivitySeven ? 'Barangay Clearance' : 'Medical Certificate'}</h2>
+                {isPreImmersionActivityEight && <p>Please attach your MEDICAL CERTIFICATE here.</p>}
+                <label className="academic-portfolio-upload">
+                  <span>
+                    {uploadingSection === selectedSection.section
+                      ? 'Uploading document...'
+                      : (isPreImmersionActivitySeven ? content.clearance_file_ref : content.medical_certificate_file_ref)
+                        ? 'Replace File'
+                        : 'Choose File'}
+                  </span>
+                  <input
+                    type="file"
+                    accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+                    onChange={(event) => uploadAcademicActivityDocument(
+                      selectedSection.section,
+                      isPreImmersionActivitySeven ? 'clearance_file' : 'medical_certificate_file',
+                      isPreImmersionActivitySeven ? 'activity-7-barangay-clearance' : 'activity-8-medical-certificate',
+                      event,
+                    )}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                    aria-label={`Upload or replace ${isPreImmersionActivitySeven ? 'Barangay Clearance' : 'Medical Certificate'}`}
+                  />
+                </label>
+                {(isPreImmersionActivitySeven ? content.clearance_file_ref : content.medical_certificate_file_ref) ? (
+                  <p className="academic-clearance-file">
+                    <strong>Preview / download:</strong>{' '}
+                    <AcademicPortfolioFileLink
+                      attachment={isPreImmersionActivitySeven ? content.clearance_file_ref : content.medical_certificate_file_ref}
+                    />
+                    <span>
+                      {formatPortfolioFileSize(
+                        (isPreImmersionActivitySeven ? content.clearance_file_ref : content.medical_certificate_file_ref).size
+                      )}
+                    </span>
+                  </p>
+                ) : (
+                  <p className="academic-portfolio-empty-attachments">No document uploaded.</p>
+                )}
+              </section>
+              {isPreImmersionActivityEight && (
+                <section className="academic-medical-certificate-sample">
+                  <h2>III. SAMPLE MEDICAL CERTIFICATE</h2>
+                  <div className="academic-medical-certificate-paper">
+                    <h3>MEDICAL CERTIFICATE</h3>
+                    <p>To Whom It May Concern:</p>
+                    <p>
+                      This is to certify that I have personally examined ________________________________,
+                      age __________, from __________________________________, born on ________________________,
+                      and have found that he/she is physically fit, during the time of examination, to do the
+                      work immersion.
+                    </p>
+                    <h4>Physical Examination</h4>
+                    <dl className="academic-medical-examination">
+                      {['Date examined', 'Height', 'Weight', 'Blood Pressure', 'Pulse, Resting', 'Respiratory Rate'].map((label) => (
+                        <div key={label}>
+                          <dt>{label}:</dt>
+                          <dd />
+                        </div>
+                      ))}
+                    </dl>
+                    <p><strong>Other Remarks:</strong></p>
+                    <div className="academic-medical-remarks-space" />
+                    <h4>Other Findings</h4>
+                    <div className="academic-medical-findings-scroll">
+                      <table className="academic-medical-findings">
+                        <thead>
+                          <tr>
+                            <th>Other Findings</th>
+                            <th>Yes</th>
+                            <th>No</th>
+                            <th>If Yes, please specify</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {['Asthma', 'Food Allergy', 'Undergone Operation', 'Kidney Infection', 'Heart Ailment', 'Others'].map((finding) => (
+                            <tr key={finding}>
+                              <th scope="row">{finding}</th>
+                              <td />
+                              <td />
+                              <td />
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="academic-medical-officer">
+                      <strong>Medical Officer</strong>
+                      <span>For Work Immersion Only</span>
+                    </div>
+                  </div>
+                  <p className="academic-medical-sample-note">
+                    Reference layout only; this is not a substitute for an actual medical certificate issued by an authorized medical professional.
+                  </p>
+                </section>
+              )}
+              <p
+                role="status"
+                className={`academic-activity-clearance-status ${
+                  isPreImmersionActivitySeven
+                    ? hasUnsavedActivitySeven ? 'unsaved' : hasSavedActivitySeven ? 'saved' : ''
+                    : hasUnsavedActivityEight ? 'unsaved' : hasSavedActivityEight ? 'saved' : ''
+                }`}
+              >
+                {loading
+                  ? 'Loading your saved answers...'
+                  : savingSection === selectedSection.section || uploadingSection === selectedSection.section
+                    ? 'Saving your answers...'
+                    : isPreImmersionActivitySeven
+                      ? hasUnsavedActivitySeven
+                        ? 'Unsaved changes'
+                        : hasSavedActivitySeven ? saveMessage || 'Saved' : 'Not saved yet'
+                      : hasUnsavedActivityEight
+                        ? 'Unsaved changes'
+                        : hasSavedActivityEight ? saveMessage || 'Saved' : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isPreImmersionActivityFive ? (
+            <div className="academic-activity-five-content">
+              <section className="academic-resume-upload">
+                <h2>Please attach your resume here.</h2>
+                <p>Upload a PDF, DOC, or DOCX file. Your uploaded resume is kept separate from the sample resume below.</p>
+                <label className="academic-portfolio-upload">
+                  <span>
+                    {uploadingSection === selectedSection.section
+                      ? 'Uploading resume...'
+                      : content.resume_file ? 'Replace Resume' : 'Choose Resume'}
+                  </span>
+                  <input
+                    type="file"
+                    accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    onChange={uploadAcademicResume}
+                    disabled={loading || uploadingSection === selectedSection.section}
+                    aria-label="Upload or replace your resume"
+                  />
+                </label>
+                {content.resume_file ? (
+                  <p className="academic-resume-file">
+                    <strong>Preview / download:</strong>{' '}
+                    <AcademicPortfolioFileLink attachment={content.resume_file} />
+                    <span>{formatPortfolioFileSize(content.resume_file.size)}</span>
+                  </p>
+                ) : (
+                  <p className="academic-portfolio-empty-attachments">No resume uploaded.</p>
+                )}
+                <p
+                  role="status"
+                  className={`academic-activity-five-status ${hasUnsavedActivityFive ? 'unsaved' : hasSavedActivityFive ? 'saved' : ''}`}
+                >
+                  {loading
+                    ? 'Loading your saved resume...'
+                    : uploadingSection === selectedSection.section || savingSection === selectedSection.section
+                      ? 'Saving your resume...'
+                      : hasUnsavedActivityFive
+                        ? 'Unsaved resume changes'
+                        : hasSavedActivityFive
+                          ? saveMessage || 'Resume saved'
+                          : 'No resume saved yet'}
+                </p>
+              </section>
+
+              <section className="academic-sample-resume" aria-label="Sample Resume example">
+                <h2>Sample Resume</h2>
+                <p className="academic-sample-resume-note">Example only — this is not your uploaded resume.</p>
+                <div className="academic-sample-resume-section">
+                  <h3>Personal Information</h3>
+                  <ul>
+                    <li>Name</li>
+                    <li>Home Address</li>
+                    <li>Cellphone Number</li>
+                    <li>E-mail Address</li>
+                    <li>Date of Birth</li>
+                    <li>Gender</li>
+                    <li>Field of Training</li>
+                  </ul>
+                </div>
+                <div className="academic-sample-resume-section">
+                  <h3>Education</h3>
+                  <ul>
+                    <li>School Name</li>
+                    <li>Educational Level</li>
+                    <li>Year Graduated</li>
+                  </ul>
+                </div>
+                <div className="academic-sample-resume-section">
+                  <h3>Field of Study</h3>
+                </div>
+                <div className="academic-sample-resume-section">
+                  <h3>Relevant Work Experience</h3>
+                </div>
+                <div className="academic-sample-resume-section">
+                  <h3>Skills / Qualifications</h3>
+                  <ul>
+                    <li>Computer Skills</li>
+                    <li>NC II Certificate</li>
+                  </ul>
+                </div>
+                <div className="academic-sample-resume-section">
+                  <h3>Special Awards / Honors / Certificates</h3>
+                </div>
+                <div className="academic-sample-resume-section">
+                  <h3>Activities &amp; Interests</h3>
+                  <ul>
+                    <li>Restaurant Skills</li>
+                    <li>Kitchen Skills</li>
+                    <li>Front Office Skills</li>
+                  </ul>
+                </div>
+              </section>
+            </div>
+          ) : isPreImmersionActivityFour ? (
+            <div className="academic-activity-four-content">
+              <p>{selectedSection.description}</p>
+              <label className="academic-portfolio-field academic-activity-four-answer">
+                <span>Your answer</span>
+                <textarea
+                  value={content.conflict_resolution_answer || ''}
+                  onChange={(event) => updateField(
+                    selectedSection.section,
+                    'conflict_resolution_answer',
+                    event.target.value,
+                  )}
+                  rows={16}
+                  maxLength={10000}
+                  disabled={loading}
+                />
+              </label>
+              <p
+                role="status"
+                className={`academic-activity-four-status ${hasUnsavedActivityFour ? 'unsaved' : hasSavedActivityFour ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved answer...'
+                  : savingSection === selectedSection.section
+                    ? 'Saving your answer...'
+                    : hasUnsavedActivityFour
+                      ? 'Unsaved changes'
+                      : hasSavedActivityFour
+                        ? saveMessage || 'Saved'
+                        : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isPreImmersionActivityThree ? (
+            <div className="academic-activity-three-content">
+              <h2>CONFIDENTIALITY IN THE WORKPLACE</h2>
+              <p>Suppose you work in a police station or a law firm and signed a confidentiality agreement regarding all their cases at hand, suddenly your friend who was a suspect to a crime asked you for some documents that are in your office’s possession that may help him in his case. How would you deal with the situation?</p>
+              <label className="academic-portfolio-field academic-activity-three-answer">
+                <span>Your answer</span>
+                <textarea
+                  value={content.situational_analysis_answer || ''}
+                  onChange={(event) => updateField(
+                    selectedSection.section,
+                    'situational_analysis_answer',
+                    event.target.value,
+                  )}
+                  rows={16}
+                  maxLength={10000}
+                  disabled={loading}
+                />
+              </label>
+              <p
+                role="status"
+                className={`academic-activity-three-status ${hasUnsavedActivityThree ? 'unsaved' : hasSavedActivityThree ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved answer...'
+                  : savingSection === selectedSection.section
+                    ? 'Saving your answer...'
+                    : hasUnsavedActivityThree
+                      ? 'Unsaved changes'
+                      : hasSavedActivityThree
+                        ? saveMessage || 'Saved'
+                        : 'Not saved yet'}
+              </p>
+            </div>
+          ) : isPreImmersionActivityTwo ? (
+            <>
+              <div className="academic-activity-two-table-scroll">
+                <table className="academic-activity-two-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">No.</th>
+                      <th scope="col">DO’s</th>
+                      <th scope="col">DON’Ts</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ACADEMIC_PRE_IMMERSION_ACTIVITY_TWO_ROWS.map(({ number, dosKey, dontsKey }) => (
+                      <tr key={number}>
+                        <th scope="row">{number}</th>
+                        <td>
+                          <textarea
+                            aria-label={`Row ${number} DO’s`}
+                            value={content[dosKey] || ''}
+                            onChange={(event) => updateField(selectedSection.section, dosKey, event.target.value)}
+                            rows={2}
+                            maxLength={10000}
+                            disabled={loading}
+                          />
+                        </td>
+                        <td>
+                          <textarea
+                            aria-label={`Row ${number} DON’Ts`}
+                            value={content[dontsKey] || ''}
+                            onChange={(event) => updateField(selectedSection.section, dontsKey, event.target.value)}
+                            rows={2}
+                            maxLength={10000}
+                            disabled={loading}
+                          />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <h2 className="academic-activity-two-reflection-heading">Reflection</h2>
+              <label className="academic-portfolio-field academic-activity-two-reflection-field">
+                <strong>1. Do you agree to the company’s policy guidelines, rules and agreement? Support your answer.</strong>
+                <textarea
+                  value={content.policy_reflection || ''}
+                  onChange={(event) => updateField(selectedSection.section, 'policy_reflection', event.target.value)}
+                  rows={8}
+                  maxLength={10000}
+                  disabled={loading}
+                />
+              </label>
+              <label className="academic-portfolio-field academic-activity-two-reflection-field">
+                <strong>2. Was there a rule that you think is not acceptable to you? Why?</strong>
+                <textarea
+                  value={content.unacceptable_rule_reflection || ''}
+                  onChange={(event) => updateField(selectedSection.section, 'unacceptable_rule_reflection', event.target.value)}
+                  rows={8}
+                  maxLength={10000}
+                  disabled={loading}
+                />
+              </label>
+              <p
+                role="status"
+                className={`academic-activity-two-status ${hasUnsavedActivityTwo ? 'unsaved' : hasSavedActivityTwo ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved answers...'
+                  : savingSection === selectedSection.section
+                    ? 'Saving your answers...'
+                    : hasUnsavedActivityTwo
+                      ? 'Unsaved changes'
+                      : hasSavedActivityTwo
+                        ? saveMessage || 'Saved'
+                        : 'Not saved yet'}
+              </p>
+            </>
+          ) : isPreImmersionActivityOne ? (
+            <>
+              <div className="academic-pre-immersion-content">
+                <h2>Learner’s Activity</h2>
+                <p>Attends the pre-immersion orientation</p>
+                <p>As one to join the workforce in the future, you will need to do, prepare and secure the following:</p>
+                <ul>
+                  <li>Resume</li>
+                  <li>Essay on how to conduct oneself inside the company establishment during the immersion period</li>
+                  <li>Application letter</li>
+                </ul>
+                <p>Clearance documents such as:</p>
+                <ul>
+                  <li>Medical certificate</li>
+                  <li>Barangay Clearance</li>
+                  <li>Certificates for required trainings and seminars</li>
+                  <li>Job Interview Skills Training</li>
+                </ul>
+                <p>You will also prepare and accomplish own portfolio and update it from time to time because at the end of the work immersion you will need to present this portfolio. Make sure to attach needed documents, answer reflection leaf and paste pictures. Happy working!</p>
+                <h2>Echoes and Ponder</h2>
+                <h3>Activity 1 | The Worker</h3>
+                <p>Work is on your way. Are you prepared to work? Do you have the potential, character, talents, and skills to take up the vigor of being a worker? What should you possess to become a good worker? How will you prepare for work immersion?</p>
+              </div>
+              {renderField(selectedSection.fields[0])}
+              <p
+                role="status"
+                className={`academic-reflection-status ${hasUnsavedReflection ? 'unsaved' : hasSavedReflection ? 'saved' : ''}`}
+              >
+                {loading
+                  ? 'Loading your saved reflection...'
+                  : savingSection === selectedSection.section
+                    ? 'Saving your reflection...'
+                    : hasUnsavedReflection
+                      ? 'Unsaved changes'
+                      : hasSavedReflection
+                        ? saveMessage || 'Saved'
+                        : 'Not saved yet'}
+              </p>
+            </>
+          ) : isStudentInformationSheet ? (
+            <>
+              <div className="academic-student-information-top">
+                <div className="academic-student-photo-column">
+                  <AcademicPortfolioStudentPhoto
+                    userId={user?.id}
+                    photo={content.student_photo}
+                    previewUrl={studentPhotoFile?.previewUrl}
+                    loading={loading || uploadingSection === selectedSection.section}
+                    onChange={uploadStudentPhoto}
+                  />
+                </div>
+                <div className="academic-student-information-fields">
+                  {selectedSection.fields.slice(0, 6).map(renderField)}
+                </div>
+              </div>
+              <div className="academic-student-information-questions">
+                {selectedSection.fields.slice(6).map(renderField)}
+              </div>
+            </>
+          ) : (
+            selectedSection.fields.map(renderField)
+          )}
+
+          {!isPreImmersionActivityOne
+            && !isPreImmersionActivityFive
+            && !isPreImmersionActivitySix
+            && !isPreImmersionActivitySeven
+            && !isPreImmersionActivityEight
+            && !isPreImmersionActivityNine
+            && !isPreImmersionActivityTen
+            && !isImmersionActivityEleven
+            && !isImmersionActivityTwelve
+            && !isTheCompany
+            && !isCompanyProfile
+            && !isActivityFifteen
+            && !isActivitySixteen
+            && !isActivitySeventeen
+            && !isActivityEighteen
+            && !isActivityNineteen
+            && !isAssessment
+            && !isReferences && (
+            <div className="academic-portfolio-attachments">
+              <h2>Attachments</h2>
+              <p>Upload supporting forms, documents, or work samples for this section.</p>
+              <label className="academic-portfolio-upload">
+                <span>{uploadingSection === selectedSection.section ? 'Uploading...' : 'Choose a file'}</span>
+                <input
+                  type="file"
+                  onChange={(event) => uploadAttachment(selectedSection, event)}
+                  disabled={loading || uploadingSection === selectedSection.section}
+                />
+              </label>
+              {attachments.length > 0 ? (
+                <ul className="academic-portfolio-attachment-list">
+                  {attachments.map((attachment) => (
+                    <li key={attachment.path}>
+                      <AcademicPortfolioFileLink attachment={attachment} />
+                      <span>{formatPortfolioFileSize(attachment.size)}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="academic-portfolio-empty-attachments">No files attached.</p>
+              )}
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="primary-btn"
+            onClick={() => {
+              const savedReferenceEditor = isReferences && hasSavedReferences
+              if (savedReferenceEditor && editingSectionKey !== selectedSection.section) {
+                setEditingSectionKey(selectedSection.section)
+                return
+              }
+              const savedTextEditor = (isActivitySixteen && hasSavedActivitySixteen)
+                || (isActivityNineteen && hasSavedActivityNineteen)
+              if (savedTextEditor && editingSectionKey !== selectedSection.section) {
+                setEditingSectionKey(selectedSection.section)
+                return
+              }
+              saveSelectedSection(selectedSection.section)
+            }}
+            disabled={loading || savingSection === selectedSection.section || uploadingSection === selectedSection.section}
+          >
+            {savingSection === selectedSection.section
+              ? 'Saving...'
+              : isReferences && hasSavedReferences && editingSectionKey !== selectedSection.section
+                ? 'Edit References'
+              : isActivitySixteen && hasSavedActivitySixteen && editingSectionKey !== selectedSection.section
+                ? 'Edit Activity 16'
+                : isActivityNineteen && hasSavedActivityNineteen && editingSectionKey !== selectedSection.section
+                  ? 'Edit Reflection'
+              : isPreImmersionActivityOne
+                ? 'Save Reflection'
+                  : isPreImmersionActivityTwo
+                    ? 'Save Activity 2'
+                    : isPreImmersionActivityThree
+                      ? 'Save Activity 3'
+                    : isPreImmersionActivityFour
+                      ? 'Save Activity 4'
+                      : isPreImmersionActivityFive
+                        ? 'Save Activity 5'
+                        : isPreImmersionActivitySix
+                          ? 'Save Application Letter'
+                          : isPreImmersionActivitySeven
+                            ? 'Save Activity 7'
+                            : isPreImmersionActivityEight
+                              ? 'Save Activity 8'
+                              : isPreImmersionActivityNine
+                                ? 'Save Activity 9'
+                                : isPreImmersionActivityTen
+                                  ? 'Save Activity 10'
+                                  : isImmersionActivityEleven
+                                    ? 'Save Activity 11'
+                                    : isImmersionActivityTwelve
+                                      ? 'Save Consent Form'
+                                      : isTheCompany
+                                        ? 'Save Company Responses'
+                                        : isCompanyProfile
+                                          ? 'Save Activity 13'
+                                          : isActivityFifteen
+                                            ? 'Save Activity 15'
+                                            : isActivitySixteen
+                                              ? 'Save Activity 16'
+                                              : isActivitySeventeen
+                                                ? 'Save Activity 17'
+                                                : isActivityEighteen
+                                                  ? 'Save Activity 18'
+                                                  : isActivityNineteen
+                                                    ? 'Save Activity 19'
+                                        : isReferences
+                                          ? 'Save References'
+                                          : 'Save Changes'}
+          </button>
+        </section>
+      </div>
+    )
+  }
+
+  return (
+    <div className="dashboard-section academic-portfolio">
+      <p className="eyebrow">STUDENT DASHBOARD / MY PORTFOLIO</p>
+      <h1>Academic My Portfolio</h1>
+      <p>Complete and save the student portfolio activities. Your teacher and supervisor can complete the separate assessment afterward.</p>
+
+      <div className="progress-overview-card">
+        <div className="progress-overview-header">
+          <div>
+            <span className="eyebrow">PORTFOLIO PROGRESS</span>
+            <h2>{loading ? 'Loading...' : `${progress.completedActivities} of ${progress.totalActivities} activities complete`}</h2>
+          </div>
+          <strong>{loading ? '…' : `${progress.percentage}%`}</strong>
+        </div>
+        <div className="progress-bar">
+          <div className="progress-fill" style={{ width: `${loading ? 0 : progress.percentage}%` }} />
+        </div>
+      </div>
+
+      <div className="academic-portfolio-actions">
+        <button type="button" className="pdf-btn" onClick={downloadFillablePdf} disabled={downloadingPdf}>
+          <Download size={16} />
+          {downloadingPdf ? 'Preparing PDF...' : 'Download Fillable PDF'}
+        </button>
+      </div>
+
+      {loading && <p role="status">Loading your saved portfolio...</p>}
+      {errorMessage && <p role="alert" className="academic-portfolio-error">{errorMessage}</p>}
+      {saveError && <p role="alert" className="academic-portfolio-error">{saveError}</p>}
+      {saveMessage && <p role="status" className="academic-portfolio-success">{saveMessage}</p>}
+      {submissionError && <p role="alert" className="academic-portfolio-error">{submissionError}</p>}
+      {submissionMessage && <p role="status" className="academic-portfolio-success">{submissionMessage}</p>}
+
+      <div className="academic-portfolio-groups">
+        {ACADEMIC_PORTFOLIO_GROUPS.map((group) => {
+          const groupProgress = progress.groups.find((item) => item.title === group)
+          return (
+            <section className="academic-portfolio-group" key={group}>
+              <div className="academic-portfolio-group-header">
+                <div><h2>{group}</h2></div>
+                <span>
+                  {groupProgress
+                    ? `${groupProgress.completed}/${groupProgress.total} activities`
+                    : 'Reference material'}
+                </span>
+              </div>
+              {group === 'IMMERSION PROPER' && (
+                <p className="academic-immersion-introduction">
+                  Dear student you are now nearing your immersion proper. Before the immersion proper please ensure that you have a signed parent’s permit and kindly attach your insurance policy here.
+                </p>
+              )}
+              <div className="academic-portfolio-card-list">
+                {ACADEMIC_PORTFOLIO_SECTIONS.filter((section) => section.group === group).map((section) => {
+                  const activityProgress = groupProgress?.activities
+                    .find((activity) => activity.section === section.section)
+                  const isComplete = activityProgress?.completed || false
+                  return (
+                    <button
+                      type="button"
+                      className="academic-portfolio-activity-card"
+                      key={section.section}
+                      onClick={() => {
+                        setSelectedSectionKey(section.section)
+                        setEditingSectionKey('')
+                        setSaveError('')
+                        setSaveMessage('')
+                      }}
+                      disabled={loading}
+                    >
+                      <span className="academic-portfolio-activity-copy">
+                        <strong>{section.title}</strong>
+                        <span>{section.description}</span>
+                      </span>
+                      <span className={`academic-portfolio-completion ${isComplete ? 'complete' : ''}`}>
+                        {activityProgress ? (isComplete ? 'Complete' : 'Pending') : 'Reference'}
+                      </span>
+                      <ArrowLeft size={17} className="academic-portfolio-activity-arrow" />
+                    </button>
+                  )
+                })}
+              </div>
+            </section>
+          )
+        })}
+      </div>
+
+      <section className="academic-portfolio-submit">
+        <div>
+          <h2>Submit Portfolio</h2>
+          <p>Submitting creates a dated snapshot for your teacher to review. Your saved draft remains editable.</p>
+        </div>
+        <button
+          type="button"
+          className="primary-btn"
+          onClick={submitPortfolio}
+          disabled={loading || submitting || !progress.canSubmit}
+        >
+          {submitting ? 'Submitting...' : 'Submit for Review'}
+        </button>
+      </section>
+    </div>
+  )
+}
+
+function AcademicPortfolioStudentPhoto({ userId, photo, previewUrl, loading, onChange }) {
+  const [loadedPhoto, setLoadedPhoto] = useState({ path: '', url: '', error: '' })
+
+  useEffect(() => {
+    let cancelled = false
+    let resolvedUrl = ''
+    if (!userId || !photo?.path) return undefined
+
+    resolvePortfolioPhotoUrl(userId, photo.path)
+      .then((url) => {
+        if (cancelled) {
+          if (url.startsWith('blob:')) URL.revokeObjectURL(url)
+          return
+        }
+        resolvedUrl = url
+        setLoadedPhoto({ path: photo.path, url, error: '' })
+      })
+      .catch((error) => {
+        console.error('Load academic student photo failed:', error)
+        if (!cancelled) {
+          setLoadedPhoto({
+            path: photo.path,
+            url: '',
+            error: 'Saved photo could not be loaded.',
+          })
+        }
+      })
+
+    return () => {
+      cancelled = true
+      if (resolvedUrl.startsWith('blob:')) URL.revokeObjectURL(resolvedUrl)
+    }
+  }, [userId, photo?.path])
+
+  const photoUrl = previewUrl
+    || (loadedPhoto.path === photo?.path ? loadedPhoto.url : '')
+  const photoError = loadedPhoto.path === photo?.path ? loadedPhoto.error : ''
+
+  return (
+    <div className="academic-student-photo-control">
+      <label className="academic-student-photo-box">
+        {photoUrl ? (
+          <img src={photoUrl} alt="Student Information Sheet photo" />
+        ) : (
+          <span className="academic-student-photo-placeholder">2 × 2 STUDENT PHOTO</span>
+        )}
+        <span className="academic-student-photo-action">
+          {loading ? 'Uploading...' : photoUrl ? 'Change Photo' : 'Upload Photo'}
+        </span>
+        <input
+          type="file"
+          accept="image/*"
+          onChange={onChange}
+          disabled={loading}
+          aria-label="Upload a 2 by 2 student photo"
+        />
+      </label>
+      <span className="academic-student-photo-caption">2 × 2 inches</span>
+      {photoError && <span role="alert" className="academic-student-photo-error">{photoError}</span>}
+    </div>
+  )
+}
+
+function AcademicPortfolioFileLink({ attachment, previewImage = false }) {
+  const [url, setUrl] = useState('')
+  const [errorMessage, setErrorMessage] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const loadUrl = async () => {
+      try {
+        const { data, error } = await supabase.storage
+          .from('portfolio-files')
+          .createSignedUrl(attachment.path, 3600)
+        if (error) throw error
+        if (!cancelled) setUrl(data.signedUrl)
+      } catch (error) {
+        console.error('Load academic attachment link failed:', error)
+        if (!cancelled) setErrorMessage('File unavailable')
+      }
+    }
+    loadUrl()
+    return () => { cancelled = true }
+  }, [attachment.path])
+
+  if (errorMessage) return <span role="alert">{attachment.name} ({errorMessage})</span>
+  if (!url) return <span role="status">{attachment.name} (loading)</span>
+  const isImage = attachment.type?.startsWith('image/')
+    || /\.(jpe?g|png)$/i.test(attachment.name || '')
+  return (
+    <span className="academic-portfolio-file-link">
+      <a href={url} target="_blank" rel="noreferrer">{attachment.name}</a>
+      {previewImage && isImage && (
+        <img src={url} alt={`Preview of ${attachment.name}`} className="academic-portfolio-file-preview" />
+      )}
+    </span>
+  )
+}
+
+function AcademicPortfolioEvidenceGallery({ files, accept, onReplace, onRemove, disabled = false }) {
+  if (!files?.length) {
+    return <p className="academic-company-profile-empty">No files uploaded yet.</p>
+  }
+
+  return (
+    <div className="academic-company-profile-gallery">
+      {files.map((file, index) => (
+        <article className="academic-company-profile-image" key={file.path}>
+          <AcademicPortfolioFileLink attachment={file} previewImage />
+          <div className="academic-company-profile-image-actions">
+            <label className="academic-portfolio-upload">
+              <span>Replace file</span>
+              <input
+                type="file"
+                accept={accept}
+                onChange={(event) => onReplace(index, event)}
+                disabled={disabled}
+                aria-label={`Replace ${file.name}`}
+              />
+            </label>
+            <button type="button" className="secondary-btn" onClick={() => onRemove(index)} disabled={disabled}>
+              Remove
+            </button>
+          </div>
+        </article>
+      ))}
+    </div>
+  )
+}
+
+function AcademicAssessmentTable({
+  form,
+  ratings,
+  feedback,
+  disabled,
+  onRatingChange,
+  onFeedbackChange,
+}) {
+  return (
+    <section className="academic-assessment-form-section">
+      <h2>{form.title}</h2>
+      {form.subtitle && <h3>{form.subtitle}</h3>}
+      {form.objectivesTitle && <h3>{form.objectivesTitle}</h3>}
+      {form.objectives?.map((objectiveGroup) => (
+        <div className="academic-assessment-objectives" key={objectiveGroup.heading}>
+          <strong>{objectiveGroup.heading}</strong>
+          <ul>{objectiveGroup.items.map((item) => <li key={item}>{item}</li>)}</ul>
+        </div>
+      ))}
+      {form.objectivesText && <p>{form.objectivesText}</p>}
+      {form.objectiveItems && (
+        <ol className="academic-assessment-objective-list">
+          {form.objectiveItems.map((item) => <li key={item}>{item}</li>)}
+        </ol>
+      )}
+      {form.indicatorTitle && (
+        <div className="academic-assessment-indicator">
+          <strong>{form.indicatorTitle}</strong>
+          <ul>{ACADEMIC_ASSESSMENT_RATING_SCALE.map((rating) => <li key={rating}>{rating}</li>)}</ul>
+        </div>
+      )}
+      {form.note && <p className="academic-assessment-note"><em>{form.note}</em></p>}
+      <div className="academic-assessment-table-scroll">
+        <table className="academic-assessment-table">
+          <thead>
+            <tr>{form.columns.map((column, index) => <th scope="col" key={`${column}-${index}`}>{column}</th>)}</tr>
+          </thead>
+          <tbody>
+            {form.rows.map((row, rowIndex) => (
+              <tr key={`${form.key}-${rowIndex}`}>
+                {form.columns.map((column, columnIndex) => {
+                  if (columnIndex < row.length) {
+                    return <td key={`${form.key}-${rowIndex}-${columnIndex}`}>{row[columnIndex]}</td>
+                  }
+                  if (ACADEMIC_ASSESSMENT_RATING_SCALE.some((rating) => (
+                    rating.startsWith(`(${column})`)
+                  ))) {
+                    return (
+                      <td key={`${form.key}-${rowIndex}-${columnIndex}`}>
+                        <input
+                          type="radio"
+                          name={`assessment-rating-${form.key}-${rowIndex}`}
+                          value={column}
+                          checked={String(ratings[rowIndex] || '') === column}
+                          onChange={() => onRatingChange(rowIndex, column)}
+                          aria-label={`Rate ${row[0]} ${column} out of 10`}
+                          disabled={disabled}
+                        />
+                      </td>
+                    )
+                  }
+                  return (
+                    <td
+                      key={`${form.key}-${rowIndex}-${columnIndex}`}
+                      className="academic-assessment-blank-cell"
+                      aria-label={`${column} assessment cell left blank`}
+                    />
+                  )
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {form.ratingResponsibility && (
+        <div className="academic-assessment-responsibility">
+          {form.ratingResponsibility.map((line) => <strong key={line}>{line}</strong>)}
+        </div>
+      )}
+      <div className="academic-assessment-summary">
+        <strong>Perfect Score: {form.perfectScore}</strong>
+        <span>Total Raw Score <i aria-hidden="true" /></span>
+        <span>Descriptor <i aria-hidden="true" /></span>
+        <span>Average = Total Raw Score / {form.key === 'pre-immersion' ? 'No. of activities' : 'no. of activities'}</span>
+      </div>
+      <div className="academic-assessment-feedback">
+        {form.feedback.map((label, index) => {
+          const feedbackKey = `${form.key}-${index}`
+          const isSignature = label.startsWith('Name and Signature')
+          return (
+          <label className="academic-assessment-feedback-item" key={feedbackKey}>
+            <strong>{label}</strong>
+            {isSignature ? (
+              <input
+                type="text"
+                value={feedback[feedbackKey] || ''}
+                onChange={(event) => onFeedbackChange(feedbackKey, event.target.value)}
+                aria-label={label}
+                maxLength={200}
+                disabled={disabled}
+              />
+            ) : (
+              <textarea
+                value={feedback[feedbackKey] || ''}
+                onChange={(event) => onFeedbackChange(feedbackKey, event.target.value)}
+                aria-label={label}
+                rows={3}
+                maxLength={2000}
+                disabled={disabled}
+              />
+            )}
+          </label>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
+function formatPortfolioFileSize(size) {
+  if (!Number.isFinite(size) || size <= 0) return ''
+  if (size < 1024 * 1024) return `${Math.ceil(size / 1024)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function SubmissionSnapshotDetails({ snapshot, isAcademic }) {
+  if (isAcademic) {
+    return ACADEMIC_PORTFOLIO_SECTIONS.map((section) => {
+      const content = parseAcademicPortfolioContent(snapshot?.[section.section])
+      return (
+        <section className="academic-submission-section" key={section.section}>
+          <h3>{section.title}</h3>
+          {section.fields.map((field) => (
+            <div key={field.key}>
+              <strong>{field.label}</strong>
+              <p>{content[field.key] || 'No response provided.'}</p>
+            </div>
+          ))}
+          {content.attachments?.length > 0 && (
+            <div>
+              <strong>Attachments</strong>
+              {content.attachments.map((attachment) => (
+                <p key={attachment.path}><AcademicPortfolioFileLink attachment={attachment} /></p>
+              ))}
+            </div>
+          )}
+        </section>
+      )
+    })
+  }
+
+  return Object.entries(snapshot || {}).map(([section, content]) => (
+    <section className="academic-submission-section" key={section}>
+      <h3>{section}</h3>
+      <SubmissionSnapshotValue value={content} label={section} />
+    </section>
+  ))
+}
+
+function SubmissionSnapshotValue({ value, label, depth = 0 }) {
+  if (value === null || value === undefined || depth > 6) return null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (parsed && typeof parsed === 'object') {
+        return <SubmissionSnapshotValue value={parsed} label={label} depth={depth + 1} />
+      }
+    } catch {
+      return (
+        <div>
+          <strong>{label}</strong>
+          <p style={{ whiteSpace: 'pre-wrap' }}>{trimmed}</p>
+        </div>
+      )
+    }
+    return (
+      <div>
+        <strong>{label}</strong>
+        <p>{trimmed}</p>
+      </div>
+    )
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return (
+      <div>
+        <strong>{label}</strong>
+        <p>{String(value)}</p>
+      </div>
+    )
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => (
+      <SubmissionSnapshotValue
+        key={`${label}-${index}`}
+        value={item}
+        label={`${label} ${index + 1}`}
+        depth={depth + 1}
+      />
+    ))
+  }
+
+  if (typeof value.path === 'string') {
+    return (
+      <div>
+        <strong>{label}</strong>
+        <p>
+          <AcademicPortfolioFileLink
+            attachment={{
+              path: value.path,
+              name: value.name || value.path.split('/').pop(),
+            }}
+          />
+        </p>
+      </div>
+    )
+  }
+
+  return Object.entries(value).map(([key, item]) => (
+    <SubmissionSnapshotValue
+      key={`${label}-${key}`}
+      value={item}
+      label={key.replace(/[_-]/g, ' ')}
+      depth={depth + 1}
+    />
+  ))
+}
+
+function formatAcademicSubmissionDate(value) {
+  const date = value ? new Date(value) : null
+  return date && !Number.isNaN(date.getTime())
+    ? date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+    : 'Date unavailable'
 }
 
 /* =========================
@@ -2041,6 +5722,7 @@ function ProgressModule({
   title,
   completed,
   total,
+  unitLabel = 'sections',
 }) {
   const percentage =
     total > 0
@@ -2084,7 +5766,7 @@ function ProgressModule({
         </span>
 
         <span>
-          {completed} / {total} sections
+          {completed} / {total} {unitLabel}
         </span>
 
       </div>
@@ -2114,17 +5796,30 @@ function TeacherFeedback({ user, selectedFeedbackId, onClearSelectedFeedback }) 
       setLoading(true)
       setErrorMessage('')
       try {
+        const {
+          data: { user: authenticatedUser },
+          error: authError,
+        } = await supabase.auth.getUser()
+        if (authError) throw authError
+        if (!authenticatedUser?.id) {
+          throw new Error('Your authenticated student account could not be verified.')
+        }
+
+        let feedbackQuery = supabase
+          .from('teacher_feedback')
+          .select('id, teacher_id, student_id, title, message, category, created_at')
+          .eq('student_id', authenticatedUser.id)
+        if (selectedFeedbackId) {
+          feedbackQuery = feedbackQuery.eq('id', selectedFeedbackId)
+        }
+
         const [{ data: feedbackRows, error: feedbackError }, { data: notifications, error: notificationError }] =
           await Promise.all([
-            supabase
-              .from('teacher_feedback')
-              .select('id, teacher_id, student_id, title, message, category, created_at')
-              .eq('student_id', user.id)
-              .order('created_at', { ascending: false }),
+            feedbackQuery.order('created_at', { ascending: false }),
             supabase
               .from('student_notifications')
               .select('id, feedback_id, is_read')
-              .eq('recipient_id', user.id),
+              .eq('recipient_id', authenticatedUser.id),
           ])
         if (feedbackError) throw feedbackError
         if (notificationError) throw notificationError
@@ -2155,7 +5850,7 @@ function TeacherFeedback({ user, selectedFeedbackId, onClearSelectedFeedback }) 
             .from('student_notifications')
             .update({ is_read: true })
             .eq('id', requestedFeedback.notification.id)
-            .eq('recipient_id', user.id)
+            .eq('recipient_id', authenticatedUser.id)
             .eq('is_read', false)
           if (error) throw error
           const readNotification = { ...requestedFeedback.notification, is_read: true }
@@ -2169,10 +5864,17 @@ function TeacherFeedback({ user, selectedFeedbackId, onClearSelectedFeedback }) 
 
         if (!cancelled) {
           setFeedback(rows)
-          setSelectedFeedback((current) => {
-            const requestedId = selectedFeedbackId || current?.id
-            return rows.find((item) => item.id === requestedId) || null
-          })
+          if (selectedFeedbackId) {
+            const requestedFeedback = rows.find((item) => item.id === selectedFeedbackId)
+            setSelectedFeedback(requestedFeedback || null)
+            if (!requestedFeedback) {
+              setErrorMessage('This feedback could not be found for your account.')
+            }
+          } else {
+            setSelectedFeedback((current) => (
+              rows.find((item) => item.id === current?.id) || null
+            ))
+          }
         }
       } catch (error) {
         console.error('Load teacher feedback failed:', error)
@@ -2519,85 +6221,6 @@ function WorkImmersionClass() {
    SUBMISSION HISTORY
 ========================= */
 
-function SubmissionHistory() {
-  return (
-    <div className="dashboard-section">
-
-      <p className="eyebrow">
-        STUDENT DASHBOARD / SUBMISSION HISTORY
-      </p>
-
-      <h1>
-        Submission History
-      </h1>
-
-      <p>
-        View your previous portfolio
-        submissions and their status.
-      </p>
-
-      <div className="submission-empty-card">
-
-        <Clock3 size={28} />
-
-        <h2>
-          No Submissions Yet
-        </h2>
-
-        <p>
-          Your submitted portfolio
-          requirements will appear
-          here.
-        </p>
-
-      </div>
-
-    </div>
-  )
-}
-
-/* =========================
-   LEADERBOARD
-========================= */
-
-function Leaderboard() {
-  return (
-    <div className="dashboard-section">
-
-      <p className="eyebrow">
-        STUDENT DASHBOARD / LEADERBOARD
-      </p>
-
-      <h1>
-        Leaderboard
-      </h1>
-
-      <p>
-        View the completion rankings
-        of students in your Work
-        Immersion class.
-      </p>
-
-      <div className="leaderboard-empty-card">
-
-        <Trophy size={28} />
-
-        <h2>
-          No Rankings Yet
-        </h2>
-
-        <p>
-          Student rankings will
-          appear here once portfolio
-          progress is recorded.
-        </p>
-
-      </div>
-
-    </div>
-  )
-}
-
 /* =========================
    NOTIFICATIONS
 ========================= */
@@ -2834,7 +6457,7 @@ function HelpCenter({ teacherMode = false, user }) {
               {recoveryEmailError}
             </p>
           )}
-        </section>
+      </section>
       )}
 
       <div className="help-guides">
@@ -3897,98 +7520,6 @@ async function appendPortfolioSupplementPages(pdf, entries, groupTitle, handledS
 }
 
 
-async function appendPortfolioExportValue(parent, label, value, context = '') {
-  if (value === null || value === undefined || value === '') return
-
-  const fieldPath = [context, label].filter(Boolean).join('/')
-
-  if (Array.isArray(value)) {
-    for (const [index, item] of value.entries()) {
-      await appendPortfolioExportValue(
-        parent,
-        `${label} ${index + 1}`,
-        item,
-        fieldPath
-      )
-    }
-    return
-  }
-
-  if (typeof value === 'object') {
-    for (const [key, item] of Object.entries(value)) {
-      await appendPortfolioExportValue(parent, key, item, fieldPath)
-    }
-    return
-  }
-
-  const isImageField =
-    typeof value === 'string' &&
-    /(?:photo|image|picture|gallery)/i.test(fieldPath) &&
-    (
-      /(?:path|photo|image|picture|url)$/i.test(label) ||
-      (
-        label === 'Answer' &&
-        /(?:student.*photo|gallery|pictures?)/i.test(context)
-      )
-    )
-
-  const row = document.createElement('div')
-  row.className = 'portfolio-export-answer'
-
-  if (isImageField) {
-    const image = document.createElement('img')
-    image.className = 'portfolio-export-upload'
-    image.alt = formatPortfolioLabel(label)
-
-    const imageValue = value.trim()
-
-    if (/^data:image\//i.test(imageValue)) {
-      image.src = imageValue
-    } else {
-      let imageUrl = imageValue
-
-      if (!/^https?:\/\//i.test(imageValue)) {
-        const { data, error } = await supabase.storage
-          .from('portfolio-files')
-          .createSignedUrl(imageValue, 3600)
-
-        if (error) throw error
-        imageUrl = data.signedUrl
-      }
-
-      image.src = await fetchImageAsDataUrl(imageUrl)
-    }
-
-    row.append(image)
-    parent.append(row)
-    return
-  }
-
-  const title = document.createElement('strong')
-  title.textContent = `${formatPortfolioLabel(label)}: `
-
-  const answer = document.createElement('span')
-  answer.textContent = String(value)
-
-  row.append(title, answer)
-  parent.append(row)
-}
-
-
-async function fetchImageAsDataUrl(url) {
-  const response = await fetch(url)
-  if (!response.ok) {
-    throw new Error(`Could not load an image for the portfolio PDF (${response.status}).`)
-  }
-  const blob = await response.blob()
-  return await new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(reader.result)
-    reader.onerror = () => reject(new Error('Could not prepare a portfolio image for the PDF.'))
-    reader.readAsDataURL(blob)
-  })
-}
-
 function getFillablePortfolioFields(content, prefix = '', depth = 0) {
   if (depth > 8 || content === null || content === undefined || content === '') return []
 
@@ -4067,17 +7598,174 @@ function drawPdfWrappedText(page, text, { x, y, maxWidth, font, fontSize, lineHe
   return currentY
 }
 
+async function mergePdfFiles(mainPdfBytes, extraFiles) {
+  const { PDFDocument } = await import('pdf-lib')
+  const merged = await PDFDocument.load(mainPdfBytes)
+
+  for (const file of extraFiles) {
+    try {
+      if (file.type === 'application/pdf') {
+        const other = await PDFDocument.load(file.bytes)
+        const pages = await merged.copyPages(other, other.getPageIndices())
+        pages.forEach((page) => merged.addPage(page))
+      }
+    } catch (error) {
+      console.error('Skipped a file that could not be merged:', file.name, error)
+    }
+  }
+
+  return await merged.save()
+}
+
+async function createAcademicFillablePortfolioPdf(entries) {
+  const { PDFDocument, StandardFonts, PageSizes, rgb } = await import('pdf-lib')
+  const pdf = await PDFDocument.create()
+  const form = pdf.getForm()
+  const font = await pdf.embedFont(StandardFonts.Helvetica)
+  const boldFont = await pdf.embedFont(StandardFonts.HelveticaBold)
+  const pageSize = PageSizes.A4
+
+  const fieldsPerPage = 4
+  const pageCount = ACADEMIC_PORTFOLIO_SECTIONS.reduce(
+    (total, section) => total + Math.max(1, Math.ceil(section.fields.length / fieldsPerPage)),
+    0
+  )
+  let pageNumber = 0
+
+  ACADEMIC_PORTFOLIO_SECTIONS.forEach((section, sectionIndex) => {
+    const fieldPages = Math.max(1, Math.ceil(section.fields.length / fieldsPerPage))
+    for (let fieldPage = 0; fieldPage < fieldPages; fieldPage += 1) {
+      pageNumber += 1
+      const page = pdf.addPage(pageSize)
+      page.drawText('ACADEMIC WORK IMMERSION PORTFOLIO', {
+        x: 48,
+        y: pageSize[1] - 48,
+        font: boldFont,
+        size: 12,
+        color: rgb(0.1, 0.2, 0.4),
+      })
+      page.drawText(toPdfSafeText(section.title, boldFont), {
+        x: 48,
+        y: pageSize[1] - 82,
+        font: boldFont,
+        size: 18,
+      })
+      if (fieldPage === 0) {
+        const descriptionLines = section.description.match(/.{1,90}(?:\s|$)/g) || [section.description]
+        descriptionLines.forEach((line, lineIndex) => {
+          page.drawText(toPdfSafeText(line.trim(), font), {
+            x: 48,
+            y: pageSize[1] - 104 - lineIndex * 14,
+            font,
+            size: 9,
+            color: rgb(0.35, 0.35, 0.35),
+          })
+        })
+      } else {
+        page.drawText('Continued', {
+          x: 48,
+          y: pageSize[1] - 104,
+          font,
+          size: 9,
+          color: rgb(0.35, 0.35, 0.35),
+        })
+      }
+
+      const yOffset = fieldPage === 0 ? 0 : 14
+      let y = pageSize[1] - 148 - yOffset
+      const fields = section.fields.slice(
+        fieldPage * fieldsPerPage,
+        (fieldPage + 1) * fieldsPerPage
+      )
+      fields.forEach((field, fieldIndex) => {
+        const absoluteFieldIndex = fieldPage * fieldsPerPage + fieldIndex
+        const fieldName = `academic_${sectionIndex + 1}_${absoluteFieldIndex + 1}_${field.key}`
+        page.drawText(toPdfSafeText(field.label, boldFont), {
+          x: 48,
+          y,
+          font: boldFont,
+          size: 10,
+        })
+        const textField = form.createTextField(fieldName)
+        textField.enableMultiline()
+        const value = parseAcademicPortfolioContent(entries[section.section])[field.key]
+        if (value) textField.setText(String(value))
+        textField.addToPage(page, {
+          x: 48,
+          y: y - 104,
+          width: pageSize[0] - 96,
+          height: 92,
+          borderWidth: 0.8,
+          borderColor: rgb(0.55, 0.6, 0.68),
+          backgroundColor: rgb(1, 1, 1),
+          font,
+          fontSize: 10,
+        })
+        y -= 140
+      })
+      page.drawText(`Page ${pageNumber} of ${pageCount}`, {
+        x: pageSize[0] - 130,
+        y: 28,
+        font,
+        size: 8,
+        color: rgb(0.45, 0.45, 0.45),
+      })
+    }
+  })
+
+  form.updateFieldAppearances(font)
+  return pdf.save()
+}
+
+async function mergeFillablePdfs(pdfBytesList) {
+  const { PDFDocument } = await import('pdf-lib')
+  const merged = await PDFDocument.create()
+
+  for (const bytes of pdfBytesList) {
+    const source = await PDFDocument.load(bytes)
+    const pages = await merged.copyPages(source, source.getPageIndices())
+    pages.forEach((page) => merged.addPage(page))
+  }
+
+  return await merged.save()
+}
+
+const HOME_PORTFOLIO_FILENAME = 'ICT-WCSAT-Work-Immersion-2026-Portfolio.pdf'
+
+async function buildHomePortfolioPdf(user) {
+  const pdfBytesList = []
+  for (const group of PORTFOLIO_PROGRESS_GROUPS) {
+    pdfBytesList.push(await createFillablePortfolioPdf(user, group.title))
+  }
+  const mergedBytes = await mergeFillablePdfs(pdfBytesList)
+  return new Blob([mergedBytes], { type: 'application/pdf' })
+}
+
 async function createFillablePortfolioPdf(user, groupTitle) {
   const userId = user?.id
-  const { data, error } = await supabase
-    .from('portfolio_entries')
-    .select('section,content')
-    .eq('user_id', userId)
-    .order('section')
-  if (error) throw error
+  let entryRows = null
+  if (navigator.onLine) {
+    try {
+      const { data, error } = await supabase
+        .from('portfolio_entries')
+        .select('section,content')
+        .eq('user_id', userId)
+        .order('section')
+      if (error) throw error
+      entryRows = data
+    } catch (error) {
+      console.warn('Portfolio entries could not be loaded online; using the saved offline copy.', error)
+    }
+  }
+  if (!entryRows) {
+    const cachedEntries = userId ? await getPortfolioEntriesCache(userId) : []
+    entryRows = cachedEntries
+      .map((entry) => ({ section: entry.section, content: entry.content }))
+      .sort((left, right) => left.section.localeCompare(right.section))
+  }
 
   const { PDFDocument, StandardFonts, PageSizes, TextAlignment, rgb } = await import('pdf-lib')
-  const entries = (data || []).map((entry) => ({
+  const entries = (entryRows || []).map((entry) => ({
     ...entry,
     content: normalizePortfolioExportContent(entry.content),
   }))
@@ -4132,14 +7820,25 @@ async function createFillablePortfolioPdf(user, groupTitle) {
     }
     const placeSavedImage = async (path, pageIndex, bounds) => {
       if (!path) return
-      const { data: signedImage, error: signedImageError } = await supabase.storage
-        .from('portfolio-files')
-        .createSignedUrl(path, 3600)
-      if (signedImageError) throw signedImageError
+      const cachedPhoto = /^https?:\/\//i.test(String(path))
+        ? null
+        : await getPortfolioPhoto(userId, path)
+      let imageBlob = cachedPhoto?.blob || null
+      if (!imageBlob) {
+        let imageUrl = String(path)
+        if (!/^https?:\/\//i.test(imageUrl)) {
+          const { data: signedImage, error: signedImageError } = await supabase.storage
+            .from('portfolio-files')
+            .createSignedUrl(path, 3600)
+          if (signedImageError) throw signedImageError
+          imageUrl = signedImage.signedUrl
+        }
 
-      const response = await fetch(signedImage.signedUrl)
-      if (!response.ok) throw new Error('A saved portfolio photo could not be loaded.')
-      const bitmap = await createImageBitmap(await response.blob())
+        const response = await fetch(imageUrl)
+        if (!response.ok) throw new Error('A saved portfolio photo could not be loaded.')
+        imageBlob = await response.blob()
+      }
+      const bitmap = await createImageBitmap(imageBlob)
       const canvas = document.createElement('canvas')
       canvas.width = Math.round(bounds.width * 2)
       canvas.height = Math.round(bounds.height * 2)
@@ -4246,45 +7945,34 @@ async function createFillablePortfolioPdf(user, groupTitle) {
     }, { font: boldFont, fontSize: 14 })
 
     const objectivesPage = sourcePages[2]
-    objectivesPage.drawRectangle({ x: 0, y: 700, width: 612, height: 216, color: rgb(1, 1, 1) })
-    let objectivesY = 902
-    const objectiveParagraphs = [
-      'One of the goals of the K to 12 Basic Education Program is for you to develop the competencies, work ethics, and values relevant in pursuing further education and/or joining the world of work.',
-      "To become a productive citizen who contributes to our nation's development, Work Immersion is a required Senior High School subject that provides these opportunities:",
-    ]
-    objectiveParagraphs.forEach((paragraph) => {
-      objectivesY = drawWrappedParagraph(objectivesPage, paragraph, {
-        x: 72, y: objectivesY, maxWidth: 468, font: textFont, fontSize: 11.5, lineHeight: 14, firstLineIndent: 36,
-      }) - 8
-    })
-    ;[
-      '1. Become familiar with the workplace;',
-      '2. Experience employment simulation; and',
-      '3. Apply your Computer Systems Servicing competencies in an authentic work environment.',
-    ].forEach((item) => {
-      objectivesY = drawWrappedParagraph(objectivesPage, item, {
-        x: 132, y: objectivesY, maxWidth: 408, font: textFont, fontSize: 11.5, lineHeight: 14,
-      }) - 2
-    })
-    objectivesY -= 12
-    drawWrappedParagraph(objectivesPage,
-      'To achieve the above objectives, Work Immersion is a requirement for graduation from secondary education. Learners complete school-based work immersion simulation and home-based activities, then submit and present a portfolio to a panel at the end of the subject.',
-      { x: 72, y: objectivesY, maxWidth: 468, font: textFont, fontSize: 11.5, lineHeight: 14, firstLineIndent: 36 },
-    )
-
+  
+    const accountAvatarUrl = String(user?.avatar_url || '').trim()
     const studentPhotoPath = entries.find((entry) => (
       entry.section === 'Module Introduction/Student 2x2 Photo'
     ))?.content
-    await placeSavedImage(studentPhotoPath, 0, {
+    await placeSavedImage(accountAvatarUrl || studentPhotoPath, 0, {
       x: 429, y: 291, width: 117, height: 117,
     })
 
-    const { data: teacherData, error: teacherError } = await supabase
-      .from('immersion_teacher')
-      .select('teacher_name,teacher_email,teacher_phone,teacher_group_chat,teacher_messenger,teacher_photo_url')
-      .eq('id', 1)
-      .maybeSingle()
-    if (teacherError) throw teacherError
+    const teacherCacheKey = 'immersion-teacher:module-introduction'
+    let teacherData = null
+    if (navigator.onLine) {
+      try {
+        const { data, error: teacherError } = await supabase
+          .from('immersion_teacher')
+          .select('teacher_name,teacher_email,teacher_phone,teacher_group_chat,teacher_messenger,teacher_photo_url')
+          .eq('id', 1)
+          .maybeSingle()
+        if (teacherError) throw teacherError
+        teacherData = data
+        if (teacherData) await saveOfflineData(teacherCacheKey, teacherData)
+      } catch (error) {
+        console.warn('Immersion teacher details could not be loaded online; using the saved offline copy.', error)
+      }
+    }
+    if (!teacherData) {
+      teacherData = await getOfflineData(teacherCacheKey)
+    }
 
     if (teacherData) {
       const teacherFields = [
@@ -4302,8 +7990,8 @@ async function createFillablePortfolioPdf(user, groupTitle) {
         'module_intro_teacher_name_instructions',
         teacherData.teacher_name ? `${String(teacherData.teacher_name).replace(/\)$/, '')})` : '',
         3,
-        { x: 351, y: 575, width: 110, height: 17 },
-        { font: textFont, fontSize: 9, replacePrintedText: true },
+        { x: 336, y: 579, width: 125, height: 15 },
+        { font: textFont, fontSize: 9, centered: false, replacePrintedText: true },
       )
       if (teacherData.teacher_photo_url) {
         await placeSavedImage(teacherData.teacher_photo_url, 3, {
@@ -4355,9 +8043,25 @@ async function createFillablePortfolioPdf(user, groupTitle) {
         x: 90, y: dutiesY, maxWidth: 448, font: textFont, fontSize: 11.5, lineHeight: 14,
       }) - 7
     })
-    await placeSavedImage(dutiesPhotoPath, 4, {
-      x: 72, y: Math.max(120, dutiesY - 130), width: 180, height: 120,
-    })
+    
+        if (dutiesPhotoPath) {
+      const { width: signedWidth, height: signedHeight } = dutiesPage.getSize()
+      const signedPage = pdf.insertPage(5, [signedWidth, signedHeight])
+      const signedTitle = 'STUDENT DUTIES AND RESPONSIBILITIES - SIGNED COPY'
+      const signedTitleWidth = boldFont.widthOfTextAtSize(signedTitle, dutiesTitleSize)
+      signedPage.drawRectangle({ x: 72, y: 919, width: signedTitleWidth + 4, height: 17, color: rgb(1, 0.97, 0.2) })
+      signedPage.drawText(signedTitle, {
+        x: 72,
+        y: 922,
+        font: boldFont,
+        size: dutiesTitleSize,
+        color: rgb(0.06, 0.24, 0.85),
+      })
+      const signedIndex = sourcePages.push(signedPage) - 1
+      await placeSavedImage(dutiesPhotoPath, signedIndex, {
+        x: 36, y: 40, width: 540, height: 860,
+      })
+    }
 
     const howToEntry = entries.find((entry) => (
       entry.section === 'Module Introduction/How to Use This Work Immersion Module'
@@ -4430,11 +8134,46 @@ async function createFillablePortfolioPdf(user, groupTitle) {
     ]
     dateRows.forEach(({ key, y }) => addDateToCell(checklistPage, checklistDates[key], dateColumnX, y))
 
+    const studentIdEntry = entries.find((entry) => (
+      entry.section === 'Module Introduction/Student ID Photos'
+    ))
+    const studentIdContent = studentIdEntry?.content || {}
+    const idPhotos = [
+      { label: 'Back of Student ID', path: studentIdContent.back_path },
+      { label: 'Front of Student ID', path: studentIdContent.front_path },
+    ].filter((photo) => photo.path)
+    if (idPhotos.length) {
+      const { width: idPageWidth, height: idPageHeight } = sourcePages[0].getSize()
+      const idPage = pdf.addPage([idPageWidth, idPageHeight])
+      idPage.drawText(toPdfSafeText(groupTitle.toUpperCase(), boldFont), {
+        x: 54, y: idPageHeight - 50, font: boldFont, size: 10, color: rgb(0.35, 0.35, 0.35),
+      })
+      idPage.drawText('Student ID Photos', {
+        x: 54, y: idPageHeight - 80, font: boldFont, size: 15,
+      })
+      const idPageIndex = sourcePages.push(idPage) - 1
+      const idPhotoWidth = 232
+      const idPhotoHeight = 150
+      const idPhotoGap = 32
+      const idPhotoStartX = (idPageWidth - (idPhotos.length * idPhotoWidth + (idPhotos.length - 1) * idPhotoGap)) / 2
+      const idPhotoLabelY = idPageHeight - 122
+      for (const [index, photo] of idPhotos.entries()) {
+        const photoX = idPhotoStartX + index * (idPhotoWidth + idPhotoGap)
+        idPage.drawText(toPdfSafeText(photo.label, boldFont), {
+          x: photoX, y: idPhotoLabelY, font: boldFont, size: 10,
+        })
+        await placeSavedImage(photo.path, idPageIndex, {
+          x: photoX, y: idPhotoLabelY - 10 - idPhotoHeight, width: idPhotoWidth, height: idPhotoHeight,
+        })
+      }
+    }
+
     await appendPortfolioSupplementPages(pdf, entries, groupTitle, new Set([
       'Module Introduction/Cover Page',
       'Module Introduction/How to Use This Work Immersion Module',
       'Module Introduction/Student Duties Photo',
       'Module Introduction/Portfolio Checklist',
+      'Module Introduction/Student ID Photos',
     ]), textFont, boldFont)
     return await pdf.save()
   }
@@ -4454,6 +8193,9 @@ async function createFillablePortfolioPdf(user, groupTitle) {
     const templateBytes = await templateResponse.arrayBuffer()
     const pdf = await PDFDocument.load(templateBytes)
     const templateSource = await PDFDocument.load(templateBytes)
+    // pdf-lib caches its page list at load time, so capture the template-indexed
+    // pages before removing any. Kept pages stay live for drawing afterwards.
+    const sourcePages = pdf.getPages()
     if (groupTitle === 'Immersion Proper') {
       while (pdf.getPageCount() > 8) {
         pdf.removePage(pdf.getPageCount() - 1)
@@ -4464,7 +8206,6 @@ async function createFillablePortfolioPdf(user, groupTitle) {
     const font = await pdf.embedFont(StandardFonts.Helvetica)
     const boldFont = await pdf.embedFont(StandardFonts.HelveticaBold)
     const form = pdf.getForm()
-    let sourcePages = pdf.getPages()
     const group = PORTFOLIO_PROGRESS_GROUPS.find((item) => item.title === groupTitle)
     const entryContent = (section) => entries.find((entry) => entry.section === section)?.content || {}
     let templateFieldNumber = 0
@@ -4584,11 +8325,18 @@ async function createFillablePortfolioPdf(user, groupTitle) {
     const drawSavedImage = async (path, pageIndex, bounds, targetPage) => {
       const page = targetPage || sourcePages[pageIndex]
       if (!path || !page) return
-      const { data: signed, error: signedError } = await supabase.storage.from('portfolio-files').createSignedUrl(path, 3600)
-      if (signedError) throw signedError
-      const response = await fetch(signed.signedUrl)
-      if (!response.ok) throw new Error('A saved portfolio image could not be loaded for the PDF.')
-      const bitmap = await createImageBitmap(await response.blob())
+      const cachedPhoto = /^https?:\/\//i.test(String(path))
+        ? null
+        : await getPortfolioPhoto(userId, path)
+      let imageBlob = cachedPhoto?.blob || null
+      if (!imageBlob) {
+        const { data: signed, error: signedError } = await supabase.storage.from('portfolio-files').createSignedUrl(path, 3600)
+        if (signedError) throw signedError
+        const response = await fetch(signed.signedUrl)
+        if (!response.ok) throw new Error('A saved portfolio image could not be loaded for the PDF.')
+        imageBlob = await response.blob()
+      }
+      const bitmap = await createImageBitmap(imageBlob)
       const canvas = document.createElement('canvas')
       canvas.width = Math.round(bounds.width * 2)
       canvas.height = Math.round(bounds.height * 2)
@@ -4705,7 +8453,7 @@ async function createFillablePortfolioPdf(user, groupTitle) {
         drawValue(8, resume[key], 105, y, 300, { size: 8 })
       }
       drawValue(8, resume.signature, 74, 515, 180, { size: 8 })
-      if (resume.photo_path) pendingImages.push(drawSavedImage(resume.photo_path, 7, { x: 75, y: 798, width: 165, height: 110 }))
+      if (resume.photo_path) pendingImages.push(drawSavedImage(resume.photo_path, 7, { x: 116, y: 799.6, width: 122.4, height: 107.4 }))
       const consent = entryContent('Pre-Immersion/Parent Consent')
       if (consent.photo_path) {
         const consentAttachmentPage = pdf.addPage([sourcePages[1].getSize().width, sourcePages[1].getSize().height])
@@ -4723,8 +8471,8 @@ async function createFillablePortfolioPdf(user, groupTitle) {
         drawValue(index, entry.prepared_by, 76, 190, 180, { size: 8 })
         const photoBounds = {
           'Barangay Clearance': { x: 72, y: 236, width: 486, height: 500 },
-          'Police Clearance': { x: 72, y: 693, width: 486, height: 55 },
-          'Mayors Clearance': { x: 72, y: 681, width: 486, height: 54 },
+          'Police Clearance': { x: 72, y: 236, width: 486, height: 500 },
+          'Mayors Clearance': { x: 72, y: 236, width: 486, height: 500 },
           'Health Clearance': { x: 72, y: 251, width: 486, height: 485 },
         }[title]
         if (entry.photo_path) {
@@ -4817,76 +8565,13 @@ async function createFillablePortfolioPdf(user, groupTitle) {
       if (narrative.preparedBy) {
         drawValue(1, narrative.preparedBy, 78, 260, 280, { size: 8, page: narrativeLastPage })
       }
-      const companyLineSets = [
-        { key: 'natureOfBusiness', y: [813, 797, 781, 765, 750, 734, 718] },
-        { key: 'descriptionOfServices', y: [648, 632, 617, 601, 585, 569, 553] },
-        { key: 'targetClientele', y: [484, 468, 452, 436, 420, 405, 389] },
-        { key: 'companyRules', y: [319, 303, 288, 272, 256, 240, 224] },
-      ]
-      const companyFontSize = 8.5
-      const wrapCompanyAnswer = (value, maxWidth) => {
-        const safeText = toPdfSafeText(String(value || '').replace(/\s+/g, ' ').trim(), font)
-        if (!safeText) return []
-        const lines = []
-        let line = ''
-        const pushLine = () => {
-          if (line) lines.push(line)
-          line = ''
-        }
-        for (let word of safeText.split(' ')) {
-          while (font.widthOfTextAtSize(word, companyFontSize) > maxWidth) {
-            let splitAt = word.length
-            while (splitAt > 1 && font.widthOfTextAtSize(word.slice(0, splitAt), companyFontSize) > maxWidth) splitAt -= 1
-            const piece = word.slice(0, splitAt)
-            word = word.slice(splitAt)
-            if (line) pushLine()
-            lines.push(piece)
-          }
-          if (!word) continue
-          const candidate = line ? `${line} ${word}` : word
-          if (line && font.widthOfTextAtSize(candidate, companyFontSize) > maxWidth) pushLine()
-          line = line ? `${line} ${word}` : word
-        }
-        pushLine()
-        return lines
-      }
-      const companyAnswerLines = companyLineSets.map(({ key }) => ({
-        key,
-        lines: wrapCompanyAnswer(narrative[key], 465),
-      }))
-      const drawCompanyAnswerPage = (page, answerLines) => {
-        answerLines.forEach(({ key, lines }) => {
-          const lineSet = companyLineSets.find((section) => section.key === key)
-          lines.slice(0, lineSet.y.length).forEach((line, index) => {
-            page.drawText(line, {
-              x: 88,
-              y: lineSet.y[index],
-              font,
-              size: companyFontSize,
-            })
-          })
-        })
-      }
-      drawCompanyAnswerPage(sourcePages[2], companyAnswerLines)
-      let companyOverflow = companyAnswerLines.map(({ key, lines }) => ({ key, lines: lines.slice(7) }))
-      while (companyOverflow.some(({ lines }) => lines.length)) {
-        const [profileTemplatePage] = await pdf.copyPages(templateSource, [2])
-        const continuationPage = pdf.addPage(profileTemplatePage)
-        const continuationAnswers = companyOverflow.map(({ key, lines }) => ({ key, lines: lines.slice(0, 7) }))
-        continuationPage.drawText('CONTINUED', {
-          x: 472,
-          y: 846,
-          font: boldFont,
-          size: 7,
-        })
-        drawCompanyAnswerPage(continuationPage, continuationAnswers)
-        companyOverflow = companyOverflow.map(({ key, lines }) => ({ key, lines: lines.slice(7) }))
-      }
       const map = entryContent('Immersion Proper/Work Immersion Map Location')
       if (map.photo_path) {
         const [mapTemplatePage] = sourcePages
         const { width: pageWidth, height: pageHeight } = mapTemplatePage.getSize()
-        const photoAttachmentPage = pdf.addPage([pageWidth, pageHeight])
+        // Insert directly after the evaluation sheet (document index 4) so the
+        // photo page sits before the DTR pages instead of at the section end.
+        const photoAttachmentPage = pdf.insertPage(4, [pageWidth, pageHeight])
         const heading = 'WORK IMMERSION MAP / LOCATION PHOTO'
         const headingSize = 13
         photoAttachmentPage.drawText(heading, {
@@ -4915,20 +8600,31 @@ async function createFillablePortfolioPdf(user, groupTitle) {
         }, photoAttachmentPage))
       }
       const evaluation = entryContent('Immersion Proper/Evaluation Sheet')
-      drawValue(3, evaluation.studentName, 110, 898, 430, { size: 8 })
-      drawValue(3, evaluation.immersionSite, 110, 882, 430, { size: 8 })
-      drawValue(3, evaluation.periodCovered, 110, 866, 430, { size: 8 })
+      drawValue(5, evaluation.studentName, 160, 898, 380, { size: 8 })
+      drawValue(5, evaluation.immersionSite, 153, 882, 387, { size: 8 })
+      drawValue(5, evaluation.periodCovered, 155, 866, 385, { size: 8 })
       const ratingRowYs = [815, 770, 726, 681, 636, 591, 553, 514, 476, 437]
-      const ratingColumnXs = { '5': 290, '4': 345, '3': 397, '2': 441, '1': 486 }
+      const ratingOptionXs = [288.4, 347.0, 396.2, 441.2, 487.4]
+      const choiceColor = rgb(0.212, 0.373, 0.569)
       ;(evaluation.ratings || []).forEach((rating, index) => {
         if (!rating) return
-        const choiceX = ratingColumnXs[rating.choice]
-        if (choiceX !== undefined) sourcePages[3].drawText('X', { x: choiceX, y: ratingRowYs[index], font, size: 8 })
-        if (rating.score) drawValue(3, rating.score, 518, ratingRowYs[index], 43, { size: 8 })
+        const centerY = ratingRowYs[index] + 3
+        ratingOptionXs.forEach((centerX, optionIndex) => {
+          const selected = rating.choice === String(5 - optionIndex)
+          sourcePages[5].drawCircle({
+            x: centerX,
+            y: centerY,
+            size: 3.6,
+            borderWidth: 0.8,
+            borderColor: choiceColor,
+            color: selected ? choiceColor : undefined,
+          })
+        })
+        if (rating.score) drawValue(5, rating.score, 513.5, ratingRowYs[index], 49, { size: 8 })
       })
-      drawValue(3, evaluation.ratingTotal, 199, 396, 34, { size: 7.5 })
-      drawValue(3, evaluation.ratingAverage, 247, 396, 34, { size: 7.5 })
-      drawValue(3, evaluation.overallRating, 409, 396, 75, { size: 7.5 })
+      drawValue(5, evaluation.ratingTotal, 199, 396, 34, { size: 7.5 })
+      drawValue(5, evaluation.ratingAverage, 247, 396, 34, { size: 7.5 })
+      drawValue(5, evaluation.overallRating, 409, 396, 120, { size: 7.5 })
       const comments = toPdfSafeText(String(evaluation.comments || ''), font)
       const commentLines = []
       let commentLine = ''
@@ -4943,10 +8639,9 @@ async function createFillablePortfolioPdf(user, groupTitle) {
       }
       if (commentLine) commentLines.push(commentLine)
       commentLines.slice(0, 8).forEach((line, index) => {
-        sourcePages[3].drawText(line, { x: 72, y: 368 - index * 12, font, size: 8 })
+        sourcePages[5].drawText(line, { x: 72, y: 350 - index * 11.5, font, size: 8 })
       })
       const overflowingComments = commentLines.slice(8)
-      const evaluationContinuationOffset = overflowingComments.length ? 1 : 0
       if (overflowingComments.length) {
         const [commentsTemplatePage] = await pdf.copyPages(templateSource, [5])
         const commentsContinuationPage = pdf.insertPage(4, commentsTemplatePage)
@@ -4964,24 +8659,25 @@ async function createFillablePortfolioPdf(user, groupTitle) {
             size: 8,
           })
         })
-        sourcePages = pdf.getPages()
       }
-      drawValue(3, evaluation.supervisorSignature, 90, 258, 190, { size: 8 })
-      drawValue(3, evaluation.studentSignature, 330, 258, 190, { size: 8 })
+      drawValue(5, evaluation.supervisorSignature, 90, 258, 190, { size: 8 })
+      drawValue(5, evaluation.studentSignature, 330, 258, 190, { size: 8 })
       const dailyRecord = entryContent('Immersion Proper/Daily Time Record')
       const dailyPages = Array.isArray(dailyRecord.pages) ? dailyRecord.pages : []
       const dtrLayouts = [
-        { pageIndex: 4 + evaluationContinuationOffset, dateRows: [820, 674, 542, 424], taskLines: [8, 7, 6, 6], taskLineHeight: 14, firstTaskLineOffsets: [25, 25, 25, 26], taskFontSize: 7.5 },
-        { pageIndex: 5 + evaluationContinuationOffset, dateRows: [924, 786, 663, 555, 447], taskLines: [7, 7, 6, 6, 6], taskLineHeight: 16, firstTaskLineOffsets: [16, 14, 13, 14, 14], taskFontSize: 8 },
-        { pageIndex: 8 + evaluationContinuationOffset, dateRows: [924, 780, 625], taskLines: [6, 6, 6], taskLineHeight: 21, firstTaskLineOffsets: [20, 31, 31], taskFontSize: 8.5 },
-        { pageIndex: 9 + evaluationContinuationOffset, dateRows: [924, 793, 662, 531, 400, 269], taskLines: [5, 4, 4, 4, 4, 4], taskLineHeight: 20, firstTaskLineOffsets: [28, 28, 28, 28, 28, 28], taskFontSize: 8.5 },
-        { pageIndex: 10 + evaluationContinuationOffset, dateRows: [924, 804, 642, 460, 298], taskLines: [4, 6, 7, 6, 6], taskLineHeight: 20, firstTaskLineOffsets: [28, 28, 28, 28, 28], taskFontSize: 8.5 },
+        { pageIndex: 6, dateRows: [820, 674, 542, 424], taskLines: [8, 7, 6, 6], taskLineHeight: 14, firstTaskLineOffsets: [25, 25, 25, 26], taskFontSize: 7.5, signatureY: 250 },
+        { pageIndex: 7, dateRows: [924, 786, 663, 555, 447], taskLines: [7, 7, 6, 6, 6], taskLineHeight: 16, firstTaskLineOffsets: [16, 14, 13, 14, 14], taskFontSize: 8, signatureY: 290 },
+        { pageIndex: -1, copyFromPage: 8, dateRows: [924, 780, 625], taskLines: [6, 6, 6], taskLineHeight: 21, firstTaskLineOffsets: [20, 31, 31], taskFontSize: 8.5, signatureY: 407 },
+        { pageIndex: -1, copyFromPage: 9, dateRows: [924, 793, 662, 531, 400, 269], taskLines: [5, 4, 4, 4, 4, 4], taskLineHeight: 20, firstTaskLineOffsets: [28, 28, 28, 28, 28, 28], taskFontSize: 8.5, signatureY: 104 },
+        { pageIndex: -1, copyFromPage: 10, dateRows: [924, 804, 642, 460, 298], taskLines: [4, 6, 7, 6, 6], taskLineHeight: 20, firstTaskLineOffsets: [28, 28, 28, 28, 28], taskFontSize: 8.5, signatureY: 124 },
       ]
       const dailyEntries = dailyPages.flatMap((recordPage, pageNumber) => (
         (Array.isArray(recordPage?.entries) ? recordPage.entries : []).map((record) => ({
           record: record || {},
           sourcePageNumber: pageNumber,
         }))
+      )).filter(({ record }) => (
+        String(record.date ?? '').trim() || String(record.day ?? '').trim() || String(record.tasks ?? '').trim()
       ))
       const wrapDtrTaskLines = (value, maxWidth, size) => {
         const safeText = toPdfSafeText(String(value || '').replace(/\s+/g, ' ').trim(), font)
@@ -5039,8 +8735,7 @@ async function createFillablePortfolioPdf(user, groupTitle) {
         const baseDtrLayout = dtrLayouts[dtrLayouts.length - 1]
         const layout = dtrLayouts[dailyOutputPageNumber] || {
           ...baseDtrLayout,
-          pageIndex: sourcePages.length + dailyOutputPageNumber - dtrLayouts.length,
-          copyFromPage: baseDtrLayout.pageIndex,
+          pageIndex: -1,
         }
         let page = sourcePages[layout.pageIndex]
         if (!page) {
@@ -5075,13 +8770,13 @@ async function createFillablePortfolioPdf(user, groupTitle) {
         const signatureEntry = dailyEntries[dailyEntryIndex - 1]
         const signaturePage = signatureEntry ? dailyPages[signatureEntry.sourcePageNumber] : null
         if (signaturePage?.preparedBy) {
-          drawValue(layout.pageIndex, signaturePage.preparedBy, 75, 105, 180, { size: 8, page })
+          drawValue(layout.pageIndex, signaturePage.preparedBy, 75, layout.signatureY, 180, { size: 8, page })
         }
         dailyOutputPageNumber += 1
       }
       while (dtrTaskContinuations.length) {
         const continuationLayout = dtrLayouts[dtrLayouts.length - 1]
-        const [templatePage] = await pdf.copyPages(templateSource, [continuationLayout.pageIndex])
+        const [templatePage] = await pdf.copyPages(templateSource, [continuationLayout.copyFromPage])
         const page = pdf.addPage(templatePage)
         let continuationSignaturePage = null
         for (let row = 0; row < continuationLayout.dateRows.length && dtrTaskContinuations.length; row += 1) {
@@ -5104,8 +8799,62 @@ async function createFillablePortfolioPdf(user, groupTitle) {
         }
         if (continuationSignaturePage?.preparedBy) {
           page.drawText(toPdfSafeText(continuationSignaturePage.preparedBy, font), {
-            x: 75, y: 105, font, size: 8,
+            x: 75, y: continuationLayout.signatureY, font, size: 8,
           })
+        }
+      }
+      const workPhotos = (Array.isArray(dailyRecord.photo_paths) ? dailyRecord.photo_paths : [])
+        .filter((path) => typeof path === 'string' && path.trim())
+      if (workPhotos.length) {
+        const photosPerPage = 6
+        const photoColumns = 2
+        const cellWidth = 222
+        const cellHeight = 240
+        const columnGap = 24
+        const rowGap = 26
+        const { width: photoPageWidth, height: photoPageHeight } = sourcePages[0].getSize()
+        const gridStartX = (photoPageWidth - (photoColumns * cellWidth + (photoColumns - 1) * columnGap)) / 2
+        const gridTop = photoPageHeight - 120
+        for (let start = 0; start < workPhotos.length; start += photosPerPage) {
+          const photoPage = pdf.addPage([photoPageWidth, photoPageHeight])
+          const heading = 'WORK IMMERSION PHOTOS'
+          photoPage.drawText(heading, {
+            x: (photoPageWidth - boldFont.widthOfTextAtSize(heading, 13)) / 2,
+            y: photoPageHeight - 68,
+            font: boldFont,
+            size: 13,
+          })
+          const subtitle = '30-Day Work Immersion Photo Documentation'
+          photoPage.drawText(subtitle, {
+            x: (photoPageWidth - font.widthOfTextAtSize(subtitle, 9)) / 2,
+            y: photoPageHeight - 90,
+            font,
+            size: 9,
+          })
+          const slotsOnPage = Math.min(photosPerPage, workPhotos.length - start)
+          for (let slot = 0; slot < slotsOnPage; slot += 1) {
+            const column = slot % photoColumns
+            const row = Math.floor(slot / photoColumns)
+            const cellX = gridStartX + column * (cellWidth + columnGap)
+            const cellY = gridTop - (row + 1) * cellHeight - row * rowGap
+            photoPage.drawRectangle({
+              x: cellX,
+              y: cellY,
+              width: cellWidth,
+              height: cellHeight,
+              borderColor: rgb(0.72, 0.74, 0.78),
+              borderWidth: 1,
+            })
+            photoPage.drawText(`Photo ${start + slot + 1}`, {
+              x: cellX + 8, y: cellY + 8, font, size: 8,
+            })
+            pendingImages.push(drawSavedImage(workPhotos[start + slot], 0, {
+              x: cellX + 8,
+              y: cellY + 24,
+              width: cellWidth - 16,
+              height: cellHeight - 34,
+            }, photoPage))
+          }
         }
       }
       await Promise.all(pendingImages)
@@ -5164,18 +8913,81 @@ async function createFillablePortfolioPdf(user, groupTitle) {
       }
       const gallery = entryContent('Post-Immersion/Gallery')
       const galleryPages = [sourcePages[4]]
+      const gallerySlots = [
+        { x: 73.6, y: 756.0 }, { x: 321.8, y: 756.1 },
+        { x: 72.7, y: 584.4 }, { x: 321.8, y: 585.9 },
+        { x: 73.6, y: 409.3 }, { x: 322.6, y: 407.0 },
+        { x: 72.7, y: 227.1 }, { x: 323.4, y: 224.7 },
+      ].map((slot) => ({ ...slot, width: 212.8, height: 128.6 }))
+      const galleryCaptionSize = 7
+      const wrapGalleryCaption = (value, maxWidth) => {
+        const safeText = toPdfSafeText(String(value || '').replace(/\s+/g, ' ').trim(), font)
+        if (!safeText) return []
+        const lines = []
+        let line = ''
+        const pushLine = () => {
+          if (line) lines.push(line)
+          line = ''
+        }
+        for (let word of safeText.split(' ')) {
+          while (font.widthOfTextAtSize(word, galleryCaptionSize) > maxWidth) {
+            const prefix = line ? `${line} ` : ''
+            const available = Math.max(maxWidth - font.widthOfTextAtSize(prefix, galleryCaptionSize), maxWidth * 0.3)
+            let splitAt = word.length
+            while (splitAt > 1 && font.widthOfTextAtSize(word.slice(0, splitAt), galleryCaptionSize) > available) splitAt -= 1
+            const piece = word.slice(0, splitAt)
+            word = word.slice(splitAt)
+            if (line) lines.push(`${line} ${piece}`)
+            else lines.push(piece)
+            line = ''
+          }
+          if (!word) continue
+          const candidate = line ? `${line} ${word}` : word
+          if (line && font.widthOfTextAtSize(candidate, galleryCaptionSize) > maxWidth) pushLine()
+          line = line ? `${line} ${word}` : word
+        }
+        pushLine()
+        return lines
+      }
       for (const [index, item] of (gallery.items || []).entries()) {
-        const pageNumber = Math.floor(index / 8)
+        const pageNumber = Math.floor(index / gallerySlots.length)
         if (!galleryPages[pageNumber]) {
           const [galleryTemplatePage] = await pdf.copyPages(templateSource, [4])
           galleryPages[pageNumber] = pdf.addPage(galleryTemplatePage)
         }
         const page = galleryPages[pageNumber]
-        const slot = index % 8
-        const x = slot % 2 ? 335 : 75
-        const y = 700 - Math.floor(slot / 2) * 155
-        if (item.path) pendingImages.push(drawSavedImage(item.path, 4, { x, y, width: 200, height: 100 }, page))
-        drawValue(4, item.caption, x, y - 12, 200, { size: 7, page })
+        const slot = gallerySlots[index % gallerySlots.length]
+        if (item.path) {
+          pendingImages.push(drawSavedImage(item.path, 4, {
+            x: slot.x + 2.5,
+            y: slot.y + 2.5,
+            width: slot.width - 5,
+            height: slot.height - 5,
+          }, page))
+        }
+        const captionText = String(item.caption || '').trim()
+        if (!item.path && !captionText) continue
+        const captionLines = wrapGalleryCaption(
+          captionText ? `Week ${item.week}: ${captionText}` : `Week ${item.week}`,
+          slot.width - 6,
+        )
+        const visibleCaptionLines = captionLines.slice(0, 2)
+        if (captionLines.length > 2) {
+          let lastLine = visibleCaptionLines[1]
+          while (lastLine.length > 1 && font.widthOfTextAtSize(`${lastLine}…`, galleryCaptionSize) > slot.width - 6) {
+            lastLine = lastLine.slice(0, -1)
+          }
+          visibleCaptionLines[1] = `${lastLine}…`
+        }
+        visibleCaptionLines.forEach((line, lineIndex) => {
+          const lineWidth = font.widthOfTextAtSize(line, galleryCaptionSize)
+          page.drawText(line, {
+            x: slot.x + (slot.width - lineWidth) / 2,
+            y: slot.y - 10 - lineIndex * 9,
+            font,
+            size: galleryCaptionSize,
+          })
+        })
       }
       const certificate = entryContent('Post-Immersion/Certificate')
       if (certificate.photo_path) {
@@ -5698,205 +9510,6 @@ async function createFillablePortfolioPdf(user, groupTitle) {
   return await pdf.save()
 }
 
-async function createPortfolioPdf(
-  userId,
-  {
-    groupTitles = PORTFOLIO_PROGRESS_GROUPS.map((group) => group.title),
-    filename = 'i-WORKFOLIO-Portfolio.pdf',
-    portfolioEntries,
-    download = true,
-  } = {}
-) {
-  if (portfolioEntries === undefined) {
-    const { data, error } = await supabase
-      .from('portfolio_entries')
-      .select('section,content')
-      .eq('user_id', userId)
-      .order('section')
-    if (error) throw error
-    portfolioEntries = data || []
-  }
-
-  const normalizedEntries = portfolioEntries.map((entry) => ({
-    ...entry,
-    content: normalizePortfolioExportContent(entry.content),
-  }))
-  const pages = getPortfolioExportPages(normalizedEntries, groupTitles)
-
-  const html2pdfModule = await import('html2pdf.js')
-  const html2pdf = html2pdfModule.default
-  const container = document.createElement('div')
-  container.className = 'portfolio-export'
-
-  
-for (const pageInfo of pages) {
-  const page = document.createElement('section')
-  page.className = 'portfolio-export-page'
-
-  const content = document.createElement('main')
-  content.className = 'portfolio-export-content'
-
-  const title = String(pageInfo.title || '').trim()
-  const normalizedTitle = title.toLowerCase()
-  const isCover = normalizedTitle === 'cover page'
-  const isChecklist = normalizedTitle.includes('checklist')
-  const isReflection =
-    normalizedTitle.includes('reflection') ||
-    normalizedTitle.includes('evaluation')
-  const isReport =
-    normalizedTitle.includes('report') ||
-    normalizedTitle.includes('essay') ||
-    normalizedTitle.includes('narrative')
-  const isGallery =
-    normalizedTitle.includes('picture') ||
-    normalizedTitle.includes('gallery') ||
-    normalizedTitle.includes('sample output')
-
-  content.classList.add(
-    isCover ? 'portfolio-export-cover' : 'portfolio-export-form'
-  )
-
-  if (!isCover) {
-    const groupHeading = document.createElement('p')
-    groupHeading.className = 'portfolio-export-group'
-    groupHeading.textContent = pageInfo.group || 'Work Immersion'
-    content.append(groupHeading)
-  }
-
-  const heading = document.createElement('h1')
-  heading.textContent = isCover
-    ? 'TVL ICT/CSS'
-    : title
-
-  content.append(heading)
-
-  if (isCover) {
-    const coverSubtitle = document.createElement('p')
-    coverSubtitle.className = 'portfolio-export-cover-subtitle'
-    coverSubtitle.textContent = 'SCHOOL-BASED WORK IMMERSION MANUAL'
-    content.append(coverSubtitle)
-  }
-
-  if (pageInfo.staticContent) {
-    pageInfo.staticContent.forEach((text) => {
-      const paragraph = document.createElement('p')
-      paragraph.className = 'portfolio-export-answer'
-      paragraph.textContent = text
-      content.append(paragraph)
-    })
-  }
-
-  const savedContent = pageInfo.savedContent
-
-  if (savedContent !== null && savedContent !== undefined) {
-    await appendPortfolioExportValue(
-  content,
-  'Answer',
-  savedContent,
-  pageInfo.section || pageInfo.title
-)
-  } else if (!pageInfo.staticContent) {
-    const emptyState = document.createElement('p')
-    emptyState.className = 'portfolio-export-empty'
-
-    if (isChecklist) {
-      emptyState.textContent =
-        'Complete the required items in this checklist.'
-    } else if (isReflection || isReport) {
-      emptyState.textContent =
-        'Write your response in the space provided.'
-    } else if (isGallery) {
-      emptyState.textContent =
-        'Add your photos or sample outputs for this section.'
-    } else {
-      emptyState.textContent =
-        'No saved information for this section yet.'
-    }
-
-    content.append(emptyState)
-  }
-
-  page.append(content)
-  container.append(page)
-}
-
-
-  const style = document.createElement('style')
-  style.textContent = `
-    .portfolio-export {
-      width: 7.45in;
-      color: #000;
-      background: #fff;
-      font: 11pt "Times New Roman", Times, serif;
-    }
-    .portfolio-export-page {
-      box-sizing: border-box;
-      width: 7.45in;
-      min-height: 10.2in;
-      display: flex;
-      flex-direction: column;
-      padding: 0;
-      background: #fff;
-      page-break-after: always;
-      break-after: page;
-    }
-    .portfolio-export-content { flex: 1; padding: 0.15in 0; overflow-wrap: anywhere; }
-    .portfolio-export-group { margin: 0 0 0.06in; color: #555; font-size: 9pt; text-align: center; text-transform: uppercase; }
-    .portfolio-export-content h1 { margin: 0 0 0.16in; font-size: 15pt; text-align: center; }
-    .portfolio-export-answer { margin: 0 0 0.1in; white-space: pre-wrap; line-height: 1.45; }
-    .portfolio-export-answer strong { font-weight: bold; }
-    .portfolio-export-empty { margin: 0; color: #555; font-style: italic; }
-    .portfolio-export-upload { display: block; max-width: 5.5in; max-height: 5.5in; object-fit: contain; }
-    @media print { .portfolio-export-page:last-child { page-break-after: auto; break-after: auto; } }
-  `
-  container.prepend(style)
-  container.style.position = 'fixed'
-  container.style.left = '-10000px'
-  container.style.top = '0'
-  document.body.append(container)
-
-  try {
-    const pdfWorker = html2pdf()
-      .set({
-        filename,
-        margin: [0.35, 0.4, 0.35, 0.4],
-        image: { type: 'jpeg', quality: 0.98 },
-        html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
-        jsPDF: { unit: 'in', format: 'a4', orientation: 'portrait' },
-        pagebreak: { mode: ['css', 'legacy'] },
-      })
-      .from(container)
-
-    if (download) {
-      await pdfWorker.save()
-      return null
-    }
-
-    return await pdfWorker.outputPdf('blob')
-  } finally {
-    container.remove()
-  }
-}
-
-function requestPdfSaveLocation(filename) {
-  if (typeof window.showSaveFilePicker !== 'function') return null
-
-  try {
-    return window.showSaveFilePicker({
-      suggestedName: filename,
-      types: [{
-        description: 'PDF document',
-        accept: { 'application/pdf': ['.pdf'] },
-      }],
-    }).then(
-      (handle) => ({ handle }),
-      (error) => ({ error })
-    )
-  } catch (error) {
-    return Promise.resolve({ error })
-  }
-}
-
 async function savePdfBlob(blob, filename, saveRequest) {
   if (saveRequest) {
     const result = await saveRequest
@@ -5937,7 +9550,6 @@ function SettingsPage({
   const [darkMode, setDarkMode] =
     useState(false)
   const [shareEmail, setShareEmail] = useState('')
-  const [sharingPortfolio, setSharingPortfolio] = useState(false)
   const [portfolioShareError, setPortfolioShareError] = useState('')
   const [portfolioShareSuccess, setPortfolioShareSuccess] = useState('')
   const [deleteDialog, setDeleteDialog] = useState(null)
@@ -6139,6 +9751,46 @@ function SettingsPage({
     loadSettings()
   }, [user?.id])
 
+  useEffect(() => {
+    if (teacherMode || !user?.id) return undefined
+    let cancelled = false
+
+    const loadProctorEmail = async () => {
+      const { data, error } = await supabase
+        .from('class_members')
+        .select('immersion_classes(teacher_id)')
+        .eq('student_id', user.id)
+        .order('joined_at', { ascending: false })
+        .limit(1)
+
+      if (error) {
+        console.error('LOAD PROCTOR CLASS ERROR:', error)
+        return
+      }
+
+      const teacherId = data?.[0]?.immersion_classes?.teacher_id
+      if (!teacherId) return
+
+      const { data: teacher, error: teacherError } = await supabase
+        .from('profiles')
+        .select('email')
+        .eq('id', teacherId)
+        .maybeSingle()
+
+      if (teacherError) {
+        console.error('LOAD PROCTOR PROFILE ERROR:', teacherError)
+        return
+      }
+
+      if (!cancelled && teacher?.email) {
+        setShareEmail((current) => current || teacher.email)
+      }
+    }
+
+    loadProctorEmail()
+    return () => { cancelled = true }
+  }, [teacherMode, user?.id])
+
   const updateSetting = async (
     column,
     value,
@@ -6222,48 +9874,34 @@ function SettingsPage({
       }
     }
 
-  const handleSharePortfolio = async (event) => {
+  const handleSharePortfolio = (event) => {
     event.preventDefault()
     const recipientEmail = shareEmail.trim()
     if (!user?.id) {
       setPortfolioShareError('Your account could not be identified. Please log in again.')
       return
     }
-    if (!/^[^\s@]+@gmail\.com$/i.test(recipientEmail)) {
-      setPortfolioShareError('Enter a valid Gmail address.')
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)) {
+      setPortfolioShareError('Enter a valid email address.')
       return
     }
 
-    setSharingPortfolio(true)
+    const subject = 'Work Immersion portfolio submitted for assessment'
+    const body = 'Attached is my signed Work Immersion portfolio for assessment.'
+    const composeUrl =
+      'https://mail.google.com/mail/?view=cm&fs=1' +
+      `&to=${encodeURIComponent(recipientEmail)}` +
+      `&su=${encodeURIComponent(subject)}` +
+      `&body=${encodeURIComponent(body)}`
+
     setPortfolioShareError('')
-    setPortfolioShareSuccess('')
-    try {
-      const portfolioPdf = await createPortfolioPdf(user.id, {
-        filename: 'i-WORKFOLIO-Portfolio.pdf',
-        download: false,
-      })
-      const path = `${user.id}/shares/portfolio-${Date.now()}.pdf`
-      const { error: uploadError } = await supabase.storage
-        .from('portfolio-files')
-        .upload(path, portfolioPdf, { contentType: 'application/pdf', upsert: false })
-      if (uploadError) throw uploadError
-
-      const { data: signed, error: signedError } = await supabase.storage
-        .from('portfolio-files')
-        .createSignedUrl(path, 7 * 24 * 60 * 60)
-      if (signedError) throw signedError
-
-      const { error: sendError } = await supabase.functions.invoke('share-portfolio', {
-        body: { recipientEmail, portfolioUrl: signed.signedUrl },
-      })
-      if (sendError) throw sendError
-
-      setPortfolioShareSuccess(`Portfolio link sent to ${recipientEmail}. The link expires in 7 days.`)
-    } catch (error) {
-      console.error('Share portfolio failed:', error)
-      setPortfolioShareError(error?.message || 'Could not send the portfolio link.')
-    } finally {
-      setSharingPortfolio(false)
+    const composeWindow = window.open(composeUrl, '_blank')
+    if (composeWindow) {
+      setPortfolioShareSuccess(
+        `Gmail draft opened for ${recipientEmail}. Attach the portfolio PDF you downloaded from Home, then press Send.`,
+      )
+    } else {
+      window.location.href = composeUrl
     }
   }
 
@@ -6296,17 +9934,17 @@ function SettingsPage({
         <div className="settings-section-header">
 
           <h2>
-            Share Portfolio
+            Send Portfolio to Your Proctor
           </h2>
 
           <p>
-            Email a link to all four portfolio folders. The link expires in 7 days.
+            Opens a Gmail draft from your own account, addressed to your proctor.
           </p>
 
         </div>
 
         <form className="settings-share-form" onSubmit={handleSharePortfolio}>
-          <label htmlFor="portfolio-share-email">Recipient Gmail address</label>
+          <label htmlFor="portfolio-share-email">Proctor's email</label>
           <div className="settings-share-controls">
             <input
               id="portfolio-share-email"
@@ -6317,18 +9955,16 @@ function SettingsPage({
                 setPortfolioShareError('')
                 setPortfolioShareSuccess('')
               }}
-              placeholder="name@gmail.com"
+              placeholder="proctor.school@email.com"
               autoComplete="email"
               required
-              disabled={sharingPortfolio}
             />
             <button
               className="settings-action-btn"
               type="submit"
-              disabled={sharingPortfolio}
             >
               <Send size={16} />
-              {sharingPortfolio ? 'Sending...' : 'Share'}
+              Open Gmail draft
             </button>
           </div>
         </form>
@@ -6343,6 +9979,12 @@ function SettingsPage({
             {portfolioShareSuccess}
           </p>
         )}
+
+        <p className="settings-share-note">
+          Download your portfolio from the Home navigation first, attach that PDF
+          in the Gmail draft, then press Send. Any teacher's email works and can
+          be changed each time.
+        </p>
 
       </div>
       )}
@@ -7224,7 +10866,7 @@ function RequirementsChecklistPage({ user, onBack }) {
               className="class-schedule-certification-input"
               type="text"
               aria-label="Contact Person"
-              value={formValues.requirements.certificationContactPerson ?? 'DANIEL T. AUIDAN, PhD.'}
+              value={formValues.requirements.certificationContactPerson ?? 'EXCELSIS G. PASTOR, PhD.'}
               disabled={loading || saving || !user?.id}
               onChange={(event) => updateFormValue('requirements', 'certificationContactPerson', event.target.value)}
             />
@@ -8001,7 +11643,7 @@ function ApplicationLetterPage({ user, onBack }) {
         </label>
 
         <div className="application-letter-recipient">
-          <strong>EXCLESIS G. PASTOR, PhD.</strong>
+          <strong>EXCELSIS G. PASTOR, PhD.</strong>
           <span>Principal III,</span>
           <span>Western Cagayan School of Arts and Trades</span>
           <span>Centro 03, Lasam, Cagayan</span>
@@ -9441,7 +13083,7 @@ function ClassSchedulePage({ user, onBack }) {
         </p>
 
         <p>
-          <strong>Contact Person:</strong> DANIEL T. AUIDAN, PhD., Telephone No./s : __________
+          <strong>Contact Person:</strong> EXCELSIS G. PASTOR, PhD., Telephone No./s : __________
         </p>
 
         <p>
@@ -9925,6 +13567,65 @@ function StudentIdPage({ user }) {
   )
 }
 
+function TvlPortfolioSubmitButton({ user }) {
+  const [submitting, setSubmitting] = useState(false)
+  const [errorMessage, setErrorMessage] = useState('')
+  const [successMessage, setSuccessMessage] = useState('')
+
+  const submitPortfolio = async () => {
+    if (!user?.id) {
+      setErrorMessage('Your account could not be identified. Please log in again.')
+      return
+    }
+    if (!navigator.onLine) {
+      setErrorMessage('Connect to the internet before submitting your portfolio.')
+      return
+    }
+
+    setSubmitting(true)
+    setErrorMessage('')
+    setSuccessMessage('')
+    try {
+      const { data, error } = await supabase
+        .from('portfolio_entries')
+        .select('section, content')
+        .eq('user_id', user.id)
+      if (error) throw error
+      if (!data?.length) throw new Error('Save portfolio requirements before submitting your portfolio.')
+
+      const snapshot = Object.fromEntries(
+        data.map((entry) => [entry.section, entry.content])
+      )
+      const { error: submissionError } = await supabase
+        .from('academic_portfolio_submissions')
+        .insert({ student_id: user.id, snapshot, status: 'submitted' })
+      if (submissionError) throw submissionError
+
+      setSuccessMessage('Your portfolio was submitted successfully.')
+    } catch (error) {
+      console.error('Submit TVL portfolio failed:', error)
+      setErrorMessage(error?.message || 'Could not submit your portfolio.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="academic-portfolio-actions">
+      <button
+        type="button"
+        className="primary-btn"
+        onClick={submitPortfolio}
+        disabled={submitting}
+      >
+        {submitting ? 'Submitting...' : 'Submit Portfolio for Review'}
+      </button>
+      {errorMessage && <p role="alert" className="academic-portfolio-error">{errorMessage}</p>}
+      {successMessage && <p role="status">{successMessage}</p>}
+    </div>
+  )
+}
+
 function MyPortfolio({ user }) {
   const [howToUseText, setHowToUseText] = useState("This Work Immersion Learner's Manual in times of pandemic contains materials and activities related to developing your skills and knowledge required to gain relevant and practical industrial skills under the guidance of your immersion teacher. It will guide you through the accomplishment of the different documents and in accomplishing your immersion portfolio.\n\nIn this module, you are required to accomplish all the learner's output and submit the required documents. You must follow and perform the activities on your own. If you have questions, do not hesitate to ask for assistance from your immersion teacher with the following details.")
   const [howToUseDraft, setHowToUseDraft] = useState(howToUseText)
@@ -10273,27 +13974,6 @@ const uploadCoverPhoto = async (event) => {
     setUploading(false)
   }
 }
-
-
-const handleDownloadPortfolio = async () => {
-  if (!user?.id) {
-    alert('Please log in first.');
-    return;
-  }
-
-  const filename = 'My_Work_Immersion_Portfolio.pdf'
-  const saveRequest = requestPdfSaveLocation(filename)
-
-  try {
-    const pdfBlob = await createPortfolioPdf(user.id, { filename, download: false })
-    await savePdfBlob(pdfBlob, filename, saveRequest)
-  } catch (error) {
-    if (error?.name === 'AbortError') return
-    console.error('Portfolio PDF export failed:', error);
-    alert('Unable to download portfolio as PDF.');
-  }
-};
-
 
 
   const portfolioFolders = [
@@ -11298,12 +14978,7 @@ if (openModule === 'Student ID') {
           <strong>{portfolioFolders.reduce((total, folder) => total + folder.items.length, 0)}</strong>
         </div>
       </section>
-      <button
-        type="button"
-       onClick={handleDownloadPortfolio}
-      >
-      Download Portfolio as PDF
-      </button>
+      <TvlPortfolioSubmitButton user={user} />
 
       <div className="portfolio-folder-list">
 
@@ -11449,6 +15124,8 @@ function StudentHome({
   setActivePage,
 }) {
   const isAcademicStudent = isAcademicStrand(user?.strand)
+  const academicPortfolio = useAcademicPortfolioEntries(user)
+  const academicProgress = getAcademicStudentProgress(academicPortfolio.entries)
   const [homeProfile, setHomeProfile] = useState(null)
   const [moduleIntroductionEntries, setModuleIntroductionEntries] = useState({})
   const [moduleIntroductionLoading, setModuleIntroductionLoading] = useState(true)
@@ -11643,6 +15320,26 @@ setClassLoading(false)
     ? Math.round((moduleIntroductionProgress.completed / moduleIntroductionProgress.total) * 100)
     : 0
 
+  const handleDownloadAllFolders = async () => {
+    if (!user?.id) {
+      setPortfolioExportError('Your account could not be identified. Please log in again.')
+      return
+    }
+
+    setPortfolioExportingGroup('ALL')
+    setPortfolioExportError('')
+    try {
+      const pdfBlob = await buildHomePortfolioPdf(user)
+      await savePdfBlob(pdfBlob, HOME_PORTFOLIO_FILENAME, null)
+    } catch (error) {
+      if (error?.name === 'AbortError') return
+      console.error('Generate combined portfolio PDF failed:', error)
+      setPortfolioExportError(error?.message || 'Could not generate the combined portfolio PDF.')
+    } finally {
+      setPortfolioExportingGroup('')
+    }
+  }
+
   const handleDownloadFillableFolder = async (groupTitle) => {
     if (!user?.id) {
       setPortfolioExportError('Your account could not be identified. Please log in again.')
@@ -11713,10 +15410,38 @@ setClassLoading(false)
           <>
             <div className="progress-label">
               <span>Academic progress</span>
-              <strong>—</strong>
+              <strong>
+                {academicPortfolio.loading
+                  ? '…'
+                  : academicPortfolio.errorMessage
+                    ? '—'
+                    : `${academicProgress.percentage}%`}
+              </strong>
             </div>
             <div className="progress-bar">
-              <div className="progress-fill" style={{ width: '0%' }} />
+              <div
+                className="progress-fill"
+                style={{ width: `${academicPortfolio.loading || academicPortfolio.errorMessage ? 0 : academicProgress.percentage}%` }}
+              />
+            </div>
+            <div className="progress-stats">
+              <span>
+                Completed sections: <strong>{academicPortfolio.loading ? '…' : academicProgress.completedSections}</strong>
+              </span>
+              <span>
+                Remaining sections: <strong>{academicPortfolio.loading ? '…' : academicProgress.totalSections - academicProgress.completedSections}</strong>
+              </span>
+            </div>
+            {academicPortfolio.errorMessage && (
+              <p role="alert" className="workplace-essay-message error">{academicPortfolio.errorMessage}</p>
+            )}
+            <div className="academic-portfolio-actions">
+              <button type="button" className="primary-btn" onClick={() => setActivePage('My Portfolio')}>
+                Open My Portfolio
+              </button>
+              <button type="button" className="teacher-outline-btn" onClick={() => setActivePage('Progress')}>
+                View Progress
+              </button>
             </div>
           </>
         ) : (
@@ -11758,21 +15483,18 @@ setClassLoading(false)
             )}
 
             <p>Download a fillable PDF for each portfolio folder:</p>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-              {PORTFOLIO_PROGRESS_GROUPS.map((group) => (
-                <button
-                  key={group.title}
-                  className="pdf-btn"
-                  type="button"
-                  onClick={() => handleDownloadFillableFolder(group.title)}
-                  disabled={Boolean(portfolioExportingGroup)}
-                >
-                  <Download size={16} />
-                  {portfolioExportingGroup === group.title
-                    ? 'Preparing PDF...'
-                    : `Download ${group.title}`}
-                </button>
-              ))}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+              <button
+                className="pdf-btn"
+                type="button"
+                onClick={handleDownloadAllFolders}
+                disabled={Boolean(portfolioExportingGroup)}
+              >
+                <Download size={16} />
+                {portfolioExportingGroup === 'ALL'
+                  ? 'Preparing PDF...'
+                  : 'Download Portfolio'}
+              </button>
             </div>
             {portfolioExportError && (
               <p role="alert" className="workplace-essay-message error">
@@ -14856,6 +18578,12 @@ function TeacherContent({ activePage, user }) {
   const [studentProgress, setStudentProgress] = useState({})
   const [studentProgressLoading, setStudentProgressLoading] = useState(true)
   const [studentProgressError, setStudentProgressError] = useState('')
+  const [academicSubmissions, setAcademicSubmissions] = useState([])
+  const [academicSubmissionsLoading, setAcademicSubmissionsLoading] = useState(true)
+  const [academicSubmissionsError, setAcademicSubmissionsError] = useState('')
+  const [selectedAcademicSubmission, setSelectedAcademicSubmission] = useState(null)
+  const [reviewSaving, setReviewSaving] = useState(false)
+  const [reviewError, setReviewError] = useState('')
   const [recentSubmissions, setRecentSubmissions] = useState([])
   const [recentSubmissionsLoading, setRecentSubmissionsLoading] = useState(true)
   const [recentSubmissionsError, setRecentSubmissionsError] = useState('')
@@ -15025,10 +18753,13 @@ function TeacherContent({ activePage, user }) {
         }
 
         const nextProgress = Object.fromEntries(
-          studentIds.map((studentId) => [
-            studentId,
-            getPortfolioProgress(entriesByStudent[studentId]),
-          ])
+          studentIds.map((studentId) => {
+            const student = students.find((item) => item.id === studentId)
+            const progress = isAcademicStrand(student?.strand)
+              ? getAcademicPortfolioProgress(entriesByStudent[studentId])
+              : getPortfolioProgress(entriesByStudent[studentId])
+            return [studentId, progress]
+          })
         )
         if (!cancelled) setStudentProgress(nextProgress)
       } catch (error) {
@@ -15046,6 +18777,64 @@ function TeacherContent({ activePage, user }) {
 
     loadStudentProgress()
     return () => { cancelled = true }
+  }, [activePage, students])
+
+  useEffect(() => {
+    if (activePage !== 'Monitoring') return undefined
+
+    const studentIds = [...new Set(students.map((student) => student.id))]
+    let cancelled = false
+
+    const loadSubmissions = async (showLoading = false) => {
+      if (!studentIds.length) {
+        setAcademicSubmissions([])
+        setAcademicSubmissionsError('')
+        setAcademicSubmissionsLoading(false)
+        setSelectedAcademicSubmission(null)
+        return
+      }
+
+      if (showLoading) setAcademicSubmissionsLoading(true)
+      setAcademicSubmissionsError('')
+      try {
+        const { data, error } = await supabase
+          .from('academic_portfolio_submissions')
+          .select('id, student_id, snapshot, status, submitted_at, reviewed_at')
+          .in('student_id', studentIds)
+          .order('submitted_at', { ascending: false })
+        if (error) throw error
+
+        const studentById = new Map(students.map((student) => [student.id, student]))
+        const submissions = (data || []).map((submission) => ({
+          ...submission,
+          student: studentById.get(submission.student_id),
+        }))
+        if (!cancelled) {
+          setAcademicSubmissions(submissions)
+          setSelectedAcademicSubmission((selected) => (
+            submissions.find((item) => item.id === selected?.id) || null
+          ))
+        }
+      } catch (error) {
+        console.error('Load portfolio submissions for review failed:', error)
+        if (!cancelled) {
+          setAcademicSubmissionsError(error?.message || 'Could not load portfolio submissions.')
+          setAcademicSubmissions([])
+        }
+      } finally {
+        if (!cancelled && showLoading) setAcademicSubmissionsLoading(false)
+      }
+    }
+
+    loadSubmissions(true)
+    const intervalId = window.setInterval(() => loadSubmissions(), 30000)
+    const handleFocus = () => loadSubmissions()
+    window.addEventListener('focus', handleFocus)
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+      window.removeEventListener('focus', handleFocus)
+    }
   }, [activePage, students])
 
   useEffect(() => {
@@ -15261,8 +19050,13 @@ function TeacherContent({ activePage, user }) {
         .insert({
           teacher_id: user.id,
           student_id: selectedStudent.id,
-          title: 'Teacher Feedback',
+          title: selectedAcademicSubmission
+            ? 'Academic Portfolio Feedback'
+            : 'Teacher Feedback',
           message: feedbackMessage.trim(),
+          category: selectedAcademicSubmission
+            ? 'Academic Portfolio Review'
+            : null,
         })
       if (error) throw error
 
@@ -15274,6 +19068,32 @@ function TeacherContent({ activePage, user }) {
       setFeedbackError(error?.message || 'Could not send feedback. Please try again.')
     } finally {
       setFeedbackSending(false)
+    }
+  }
+
+  const markAcademicSubmissionReviewed = async (submission) => {
+    if (!submission?.id) return
+
+    setReviewSaving(true)
+    setReviewError('')
+    try {
+      const reviewedAt = new Date().toISOString()
+      const { error } = await supabase
+        .from('academic_portfolio_submissions')
+        .update({ status: 'reviewed', reviewed_at: reviewedAt })
+        .eq('id', submission.id)
+      if (error) throw error
+
+      const updatedSubmission = { ...submission, status: 'reviewed', reviewed_at: reviewedAt }
+      setAcademicSubmissions((previous) => previous.map((item) => (
+        item.id === submission.id ? updatedSubmission : item
+      )))
+      setSelectedAcademicSubmission(updatedSubmission)
+    } catch (error) {
+      console.error('Mark academic portfolio reviewed failed:', error)
+      setReviewError(error?.message || 'Could not update the submission review status.')
+    } finally {
+      setReviewSaving(false)
     }
   }
 
@@ -15896,9 +19716,7 @@ function TeacherContent({ activePage, user }) {
           <div>
             <p className="eyebrow">TEACHER DASHBOARD</p>
             <h1>Student Monitoring</h1>
-            <p>
-              Track each joined student’s Work Immersion portfolio progress.
-            </p>
+            <p>Track each joined student’s Work Immersion portfolio progress.</p>
           </div>
         </div>
 
@@ -15976,14 +19794,16 @@ function TeacherContent({ activePage, user }) {
                       />
                     </div>
                     <p className="teacher-progress-summary">
-                      {progress?.completedSections ?? 0} of {progress?.totalSections ?? 0} sections completed
+                      {progress?.completedSections ?? 0} of {progress?.totalSections ?? 0} {isAcademicStrand(student.strand) ? 'fields' : 'sections'} completed
                     </p>
                     <div className="teacher-progress-groups">
-                      {(progress?.groups || PORTFOLIO_PROGRESS_GROUPS.map((group) => ({
-                        ...group,
-                        completed: 0,
-                        total: group.modules.length,
-                      }))).map((group) => {
+                      {(progress?.groups || (isAcademicStrand(student.strand)
+                        ? getAcademicPortfolioProgress({}).groups
+                        : PORTFOLIO_PROGRESS_GROUPS.map((group) => ({
+                          ...group,
+                          completed: 0,
+                          total: group.modules.length,
+                        })))).map((group) => {
                         const percentage = group.total
                           ? Math.round((group.completed / group.total) * 100)
                           : 0
@@ -16009,6 +19829,108 @@ function TeacherContent({ activePage, user }) {
             </div>
           )}
 
+          </section>
+
+        <section className="teacher-panel">
+          <div className="teacher-panel-header">
+            <div>
+              <p className="eyebrow">CLASS SUBMISSIONS</p>
+              <h2>Submitted Portfolios</h2>
+              <p>Review submissions from your class roster. Sending feedback also notifies the student.</p>
+            </div>
+          </div>
+
+          {academicSubmissionsLoading ? (
+            <div className="teacher-empty-state" role="status">
+              <p>Loading submissions...</p>
+            </div>
+          ) : academicSubmissionsError ? (
+            <p className="teacher-progress-error" role="alert">
+              Could not load submissions: {academicSubmissionsError}
+            </p>
+          ) : academicSubmissions.length === 0 ? (
+            <div className="teacher-empty-state">
+              <FileCheck size={30} />
+              <h3>No submissions yet</h3>
+              <p>Submitted student portfolios will appear here.</p>
+            </div>
+          ) : (
+            <div className="academic-submission-list">
+              {academicSubmissions.map((submission) => (
+                <article className="academic-submission-card teacher-academic-submission" key={submission.id}>
+                  <header>
+                    <div>
+                      <h3>
+                        {submission.student?.name || 'Student'} —{' '}
+                        {getPortfolioFormat(submission.student?.strand)?.format || 'Portfolio'}
+                      </h3>
+                      <p>Submitted {formatAcademicSubmissionDate(submission.submitted_at)}</p>
+                    </div>
+                    <strong className={`academic-submission-status ${submission.status}`}>
+                      {submission.status === 'reviewed' ? 'Reviewed' : 'Pending Review'}
+                    </strong>
+                  </header>
+                  <button
+                    type="button"
+                    className="teacher-outline-btn"
+                    aria-expanded={selectedAcademicSubmission?.id === submission.id}
+                    onClick={() => {
+                      setSelectedAcademicSubmission(
+                        selectedAcademicSubmission?.id === submission.id ? null : submission
+                      )
+                      setSelectedStudent(
+                        selectedAcademicSubmission?.id === submission.id
+                          ? null
+                          : submission.student
+                      )
+                      setFeedbackError('')
+                      setFeedbackSuccess('')
+                      setReviewError('')
+                    }}
+                  >
+                    {selectedAcademicSubmission?.id === submission.id ? 'Close Portfolio' : 'Review Portfolio'}
+                  </button>
+                  {selectedAcademicSubmission?.id === submission.id && (
+                    <div className="academic-submission-review">
+                      <SubmissionSnapshotDetails
+                        snapshot={submission.snapshot}
+                        isAcademic={isAcademicStrand(submission.student?.strand)}
+                      />
+                      {reviewError && <p className="teacher-feedback-error" role="alert">{reviewError}</p>}
+                      {feedbackSuccess && <p className="teacher-feedback-success" role="status">{feedbackSuccess}</p>}
+                      {selectedStudent && (
+                        <form className="academic-review-feedback" onSubmit={handleSendFeedback}>
+                          <label htmlFor={`academic-feedback-${submission.id}`}>Feedback for {submission.student?.name || 'Student'}</label>
+                          <textarea
+                            id={`academic-feedback-${submission.id}`}
+                            value={feedbackMessage}
+                            onChange={(event) => setFeedbackMessage(event.target.value)}
+                            rows={5}
+                            required
+                          />
+                          {feedbackError && <p className="teacher-feedback-error" role="alert">{feedbackError}</p>}
+                          <button type="submit" className="teacher-primary-btn" disabled={feedbackSending}>
+                            <Send size={16} />
+                            {feedbackSending ? 'Sending...' : 'Send Feedback'}
+                          </button>
+                        </form>
+                      )}
+                      {submission.status !== 'reviewed' && (
+                        <button
+                          type="button"
+                          className="teacher-primary-btn"
+                          onClick={() => markAcademicSubmissionReviewed(submission)}
+                          disabled={reviewSaving}
+                        >
+                          {reviewSaving ? 'Saving review...' : 'Mark Reviewed'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+          )}
         </section>
 
       </div>

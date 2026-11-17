@@ -84,24 +84,6 @@ function SignUp({ onBack, onLogin, onVerificationRequired }) {
       return
     }
 
-    // Create student profile
-    const { error: profileError } = await supabase
-      .from('profiles')
-      .insert({
-        id: data.user.id,
-        full_name: fullName.trim(),
-        email: normalizedEmail,
-        role: 'student',
-        strand,
-        grade: gradeLevel.trim(),
-      })
-
-    if (profileError) {
-      console.error('Profile creation error:', profileError)
-      setError(profileError.message)
-      return
-    }
-
     const verified = Boolean(data.user.email_confirmed_at || data.user.confirmed_at)
     setSuccess(verified
       ? 'Account created successfully!'

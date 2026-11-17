@@ -46,7 +46,24 @@ export default defineConfig({
   ],
         navigateFallback: '/index.html',
         navigateFallbackDenylist: [/^\/(rest|auth|storage|functions)\/v1(?:\/|$)/],
-        cleanupOutdatedCaches: true
+        cleanupOutdatedCaches: true,
+
+        runtimeCaching: [
+          {
+            // Portfolio photos and avatars, so they still appear offline.
+            urlPattern: /\/storage\/v1\/object\/(?:public|sign)\//,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'portfolio-images',
+              matchOptions: { ignoreSearch: true },
+              expiration: {
+                maxEntries: 300,
+                maxAgeSeconds: 60 * 60 * 24 * 30
+              },
+              cacheableResponse: { statuses: [0, 200] }
+            }
+          }
+        ]
       }
     })
   ]
